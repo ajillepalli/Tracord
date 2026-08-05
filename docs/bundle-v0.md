@@ -77,6 +77,12 @@ These fields describe source-side readiness only; output-path existence and
 permissions are checked by the later export operation. When the artifact limit
 is exceeded, `files_total_is_lower_bound` is true rather than claiming an exact
 count for entries that were intentionally not collected.
+Each real-file payload opened by preview carries an independent
+`identity_verified` boolean. It is false when that source lacks positive
+descriptor and path identity evidence, even when the current bundle writer
+would otherwise accept the source. Sources skipped before opening because of
+artifact or aggregate limits omit the field and remain represented by
+incomplete coverage instead of a false identity claim.
 Operational failures in JSON mode emit a minimal object containing
 `preview_version`, `trace_valid`, and a fixed `error` code.
 
@@ -96,13 +102,19 @@ Binary and changed files can therefore increase both `bytes_read` and
 Preview describes files at scan time. A later export can observe changed files,
 so a clean preview is not proof that a later bundle is safe. On Windows,
 `O_NOFOLLOW` is unavailable; path and descriptor identity checks compensate but
-cannot make cross-platform races impossible. Windows junctions and other
+cannot make cross-platform races impossible. On Windows, `st_ctime` is creation
+time rather than POSIX inode-change time, and link counts can be unavailable or
+filesystem-dependent, so those snapshot fields do not detect every metadata
+transition. Windows junctions and other
 link-like reparse points are rejected from `st_reparse_tag`, including on Python
 3.11 where `Path.is_junction()` is unavailable. On POSIX, no-follow protects the
 final component, while a hostile parent-directory replacement remains a residual
 race. Read-only opens can update file access times on some filesystems. When
-inode identity is unavailable, preview scans with mode/size/mtime checks, marks
-coverage incomplete as `identity_unverified`, and leaves export possible.
+inode identity is unavailable, preview preserves findings from content it could
+scan and marks `identity_verified` false. Strict gating always fails on this
+uncertainty; `--allow-incomplete-scan` cannot suppress it. Export readiness stays
+faithful to the current writer and is therefore reported separately through
+`export_preflight` and `export_would_succeed`.
 
 Normal export streams each source through the same descriptor used for its
 snapshot verification. Import rejects linked run directories and parents and

@@ -14,7 +14,7 @@ Tracord is pre-1.0. The roadmap is intentionally biased toward reliability primi
 
 - File diff capture. (implemented)
 - Export preview with redaction summary. (implemented)
-- Assertion files checked into repositories.
+- Assertion files checked into repositories. (implemented)
 - Better CLI output for CI.
 
 ## v0.3
@@ -36,3 +36,5 @@ Tracord is pre-1.0. The roadmap is intentionally biased toward reliability primi
 - Which redaction profiles are safe enough for public bundle sharing?
 - How should Tracord represent partially replayable agent runs?
 - What belongs in the core trace format versus framework-specific extensions?
+- How should a future command list or run all cases without weakening deterministic validation?
+- When should bundle export require verified filesystem identity on every supported platform?

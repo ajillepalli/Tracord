@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from .redaction import redact_text
+from .storage import RUNS_DIR
 
 
 FILE_DIFF_ARTIFACT = "changes.patch"
@@ -144,13 +145,18 @@ class GitDiffCapture:
                     "GIT_OPTIONAL_LOCKS": "0",
                 }
             )
-            self._exclude_path = _relative_store_path(self.repo_root, self.store)
-            if self._exclude_path == ".":
+            relative_store = _relative_store_path(self.repo_root, self.store)
+            if relative_store == ".":
                 self._initial_result = _result(
                     "error", reason="store_contains_repository"
                 )
                 self.close()
                 return
+            self._exclude_path = (
+                f"{relative_store}/{RUNS_DIR}"
+                if relative_store is not None
+                else None
+            )
             self.before_tree = self._snapshot("before")
         except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
             self._initial_result = _error_result(
@@ -262,17 +268,35 @@ class GitDiffCapture:
                 _git_message(read_tree, self.redact) or "git read-tree failed"
             )
 
-        pathspecs = ["."]
-        if self._exclude_path is not None:
-            pathspecs.append(f":(top,literal,exclude){self._exclude_path}")
         add = _git(
             self.repo_root,
-            ["add", "-A", "--", *pathspecs],
+            ["add", "-A", "--", "."],
             env=env,
             timeout_seconds=self.git_timeout_seconds,
         )
         if add.returncode != 0:
             raise ValueError(_git_message(add, self.redact) or "git add failed")
+
+        if self._exclude_path is not None:
+            remove_store = _git(
+                self.repo_root,
+                [
+                    "rm",
+                    "-r",
+                    "-f",
+                    "--cached",
+                    "--ignore-unmatch",
+                    "--",
+                    f":(top,literal){self._exclude_path}",
+                ],
+                env=env,
+                timeout_seconds=self.git_timeout_seconds,
+            )
+            if remove_store.returncode != 0:
+                raise ValueError(
+                    _git_message(remove_store, self.redact)
+                    or "git runtime exclusion failed"
+                )
 
         write_tree = _git(
             self.repo_root,

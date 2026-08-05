@@ -14,3 +14,4 @@ The format is based on Keep a Changelog, and this project will follow semantic v
 - Added opt-in, isolated Git file-diff capture with structured summaries, redaction, binary privacy defaults, and size limits.
 - Added named redaction rules and count-only finding summaries for export safety checks.
 - Added a read-only, bounded export preview with deterministic JSON and a strict CI gate.
+- Added versioned repository assertion files, bounded safe evaluation, stable CLI result codes, and Git ownership rules that track assertions while excluding runtime runs.

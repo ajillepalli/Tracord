@@ -63,7 +63,8 @@ bin/
 *.out
 
 # Local Tracord artifacts
-.tracord/
+**/.tracord/*
+!**/.tracord/assertions.json
 traces/
 captures/
 replays/
