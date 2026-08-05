@@ -9,6 +9,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .git_capture import DEFAULT_MAX_DIFF_BYTES, GitDiffCapture
 from .redaction import redact_text
 from .schema import SCHEMA_VERSION
 from .storage import ensure_store, run_dir, write_json
@@ -35,6 +36,8 @@ def record_command(
     name: str | None = None,
     timeout_seconds: float | None = None,
     redact: bool = True,
+    capture_diff: bool = False,
+    max_diff_bytes: int = DEFAULT_MAX_DIFF_BYTES,
 ) -> dict[str, object]:
     if not command:
         raise ValueError("command must not be empty")
@@ -44,7 +47,18 @@ def record_command(
     output_dir = run_dir(root, run_id)
     output_dir.mkdir(parents=True, exist_ok=False)
 
-    cwd = str(Path.cwd())
+    working_directory = Path.cwd()
+    cwd = str(working_directory)
+    diff_capture: GitDiffCapture | None = None
+    if capture_diff:
+        diff_capture = GitDiffCapture(
+            cwd=working_directory,
+            store=root,
+            max_diff_bytes=max_diff_bytes,
+            redact=redact,
+        )
+        diff_capture.start()
+
     started_at = utc_now()
     started = time.monotonic()
     timed_out = False
@@ -77,6 +91,10 @@ def record_command(
         exit_code = None
         stdout = _decode_timeout_output(exc.stdout)
         stderr = _decode_timeout_output(exc.stderr)
+    except OSError:
+        if diff_capture is not None:
+            diff_capture.close()
+        raise
 
     finished_at = utc_now()
     duration_ms = int((time.monotonic() - started) * 1000)
@@ -106,6 +124,24 @@ def record_command(
         }
     )
 
+    file_changes: dict[str, object] | None = None
+    if diff_capture is not None:
+        file_changes = diff_capture.finish(output_dir)
+        events.append(
+            {
+                "type": "file.diff",
+                "at": utc_now(),
+                "data": file_changes,
+            }
+        )
+
+    artifacts = {
+        "stdout": STDOUT_ARTIFACT,
+        "stderr": STDERR_ARTIFACT,
+    }
+    if file_changes is not None and isinstance(file_changes.get("artifact"), str):
+        artifacts["file_diff"] = str(file_changes["artifact"])
+
     trace: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -122,12 +158,11 @@ def record_command(
         "exit_code": exit_code,
         "timed_out": timed_out,
         "redacted": redact,
-        "artifacts": {
-            "stdout": STDOUT_ARTIFACT,
-            "stderr": STDERR_ARTIFACT,
-        },
+        "artifacts": artifacts,
         "events": events,
     }
+    if file_changes is not None:
+        trace["file_changes"] = file_changes
     write_json(output_dir / "trace.json", trace)
     return trace
 

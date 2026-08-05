@@ -15,6 +15,7 @@ src/tracord/
   replay.py       # command replay
   redaction.py    # best-effort output redaction
   paths.py        # safe relative path handling
+  git_capture.py  # isolated Git before/after snapshots
 ```
 
 Recorded runs live under `.tracord/runs/<run-id>/` by default.
@@ -36,6 +37,12 @@ See [trace-v0.md](trace-v0.md) and [../schemas/trace-v0.schema.json](../schemas/
 Portable bundles are zip archives with a `.tracord.zip` suffix. Import rejects unsafe paths and writes only under the target run directory.
 
 See [bundle-v0.md](bundle-v0.md).
+
+## File Change Model
+
+Git diff capture uses temporary indexes and a temporary object directory to compare the working tree immediately before and after a command. It does not mutate the repository index, refs, working tree, or persistent object database.
+
+See [file-diff-capture.md](file-diff-capture.md).
 
 ## Design Constraints
 
