@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import tracord.export_preview as preview_module
-from tracord.bundle import export_run
+from tracord.bundle import build_manifest, export_run
 from tracord.export_preview import ExportPreviewError, gate_reasons, preview_export
 from tracord.recorder import record_command
 from tracord.storage import read_json, run_dir, write_json
@@ -204,6 +204,8 @@ def test_file_and_aggregate_limits_are_explicit(tmp_path: Path):
     assert file_limited["scan"]["complete"] is False
     assert file_limited["export_preflight"] == "unknown"
     assert file_limited["export_would_succeed"] is None
+    assert gate_reasons(file_limited, allow_incomplete_scan=True) == ["export_blocked"]
+    assert file_limited["files_total_is_lower_bound"] is True
     assert any(
         file["status"] == "aggregate_limit" for file in aggregate_limited["files"]
     )
@@ -292,6 +294,23 @@ def test_displayed_run_id_and_safe_artifact_path_are_redacted(tmp_path: Path):
     assert original_run_id not in serialized
 
 
+def test_control_character_run_id_uses_only_safe_display(tmp_path: Path):
+    store = tmp_path / "store"
+    _original_run_id, original_directory = _record(store)
+    run_id = "line\u2028run"
+    trace_directory = run_dir(store, run_id)
+    shutil.copytree(original_directory, trace_directory)
+    trace_path = trace_directory / "trace.json"
+    trace = read_json(trace_path)
+    trace["run_id"] = run_id
+    write_json(trace_path, trace)
+
+    preview = preview_export(root=store, run_id=run_id)
+
+    assert preview["run_id"] is None
+    assert preview["run_id_display"] == "line\\u2028run"
+
+
 def test_adjacent_secret_command_flag_is_gating_without_exposing_value(tmp_path: Path):
     store = tmp_path / "store"
     run_id, trace_directory = _record(store)
@@ -312,6 +331,35 @@ def test_adjacent_secret_command_flag_is_gating_without_exposing_value(tmp_path:
     assert secret not in serialized
 
 
+def test_secret_in_event_command_copy_is_gating(tmp_path: Path):
+    store = tmp_path / "store"
+    run_id, trace_directory = _record(store)
+    trace_path = trace_directory / "trace.json"
+    trace = read_json(trace_path)
+    secret = "event-command-sensitive-value"
+    trace["command"] = ["tool", "--token", "[REDACTED]"]
+    trace["events"][0]["data"]["command"] = ["tool", "--token", secret]
+    write_json(trace_path, trace)
+
+    preview = preview_export(root=store, run_id=run_id)
+
+    assert preview["findings"]["gating_total"] >= 1
+    assert secret not in json.dumps(preview)
+
+
+def test_broader_secret_flag_suffix_is_gating(tmp_path: Path):
+    store = tmp_path / "store"
+    run_id, trace_directory = _record(store)
+    trace_path = trace_directory / "trace.json"
+    trace = read_json(trace_path)
+    trace["command"] = ["tool", "--access-token", "sensitive-value"]
+    write_json(trace_path, trace)
+
+    preview = preview_export(root=store, run_id=run_id)
+
+    assert preview["findings"]["gating_total"] >= 1
+
+
 def test_projected_manifest_is_scanned_and_counted(tmp_path: Path):
     store = tmp_path / "store"
     _original_run_id, original_directory = _record(store)
@@ -330,6 +378,19 @@ def test_projected_manifest_is_scanned_and_counted(tmp_path: Path):
     assert manifest["findings"]["gating_total"] == 1
     assert preview["scan"]["files_total"] == 4
     assert secret not in json.dumps(preview)
+
+
+def test_projected_and_real_manifest_keys_stay_in_sync():
+    trace = {"schema_version": "tracord.trace.v0"}
+    projected = build_manifest(run_id="run", trace=trace, files=["trace.json"])
+    real = build_manifest(
+        run_id="run",
+        trace=trace,
+        files=["trace.json"],
+        created_at="2026-01-01T00:00:00Z",
+    )
+
+    assert set(projected) == set(real) - {"created_at"}
 
 
 def test_trace_run_id_must_match_requested_directory(tmp_path: Path):
@@ -419,7 +480,7 @@ def test_invalid_utf8_trace_matches_export_failure(tmp_path: Path):
     assert preview_error.value.code == "invalid_trace_json"
 
 
-@pytest.mark.parametrize("run_id", [".", "double//segment"])
+@pytest.mark.parametrize("run_id", [".", "double//segment", "nul\x00segment"])
 def test_raw_run_id_segments_are_rejected(tmp_path: Path, run_id: str):
     with pytest.raises(ExportPreviewError) as exc_info:
         preview_export(root=tmp_path, run_id=run_id)
@@ -554,12 +615,17 @@ def test_partial_aggregate_read_is_labelled_aggregate_limit(tmp_path: Path):
     run_id, trace_directory = _record(store)
     (trace_directory / "stderr.log").write_text("x" * 100, encoding="utf-8")
     trace_size = (trace_directory / "trace.json").stat().st_size
+    baseline = preview_export(root=store, run_id=run_id)
+    manifest_size = next(
+        file["scanned_bytes"] for file in baseline["files"] if file["id"] == "manifest"
+    )
+    total_limit = trace_size + manifest_size + 5
 
     preview = preview_export(
         root=store,
         run_id=run_id,
-        max_scan_bytes=trace_size + 5,
-        max_total_scan_bytes=trace_size + 5,
+        max_scan_bytes=total_limit,
+        max_total_scan_bytes=total_limit,
     )
     partial = next(file for file in preview["files"] if file["status"] == "aggregate_limit")
 
@@ -582,7 +648,12 @@ def test_binary_preview_and_real_export_agree_on_exportability(tmp_path: Path):
 
 @pytest.mark.parametrize(
     ("content", "code"),
-    [(b"not-json", "invalid_trace_json"), (b"{}\x00", "trace_scan_incomplete")],
+    [
+        (b"not-json", "invalid_trace_json"),
+        (b"{}\x00", "trace_scan_incomplete"),
+        (b"9" * 5000, "invalid_trace_json"),
+        (b"[" * 2000 + b"]" * 2000, "invalid_trace"),
+    ],
 )
 def test_trace_failure_codes_are_explicit(tmp_path: Path, content: bytes, code: str):
     store = tmp_path / "store"
@@ -595,14 +666,15 @@ def test_trace_failure_codes_are_explicit(tmp_path: Path, content: bytes, code: 
     assert exc_info.value.code == code
 
 
-def test_trace_scan_cap_is_an_explicit_operational_error(tmp_path: Path):
+def test_trace_uses_aggregate_ceiling_independently_of_artifact_cap(tmp_path: Path):
     store = tmp_path / "store"
     run_id, _trace_directory = _record(store)
 
-    with pytest.raises(ExportPreviewError) as exc_info:
-        preview_export(root=store, run_id=run_id, max_scan_bytes=1)
+    preview = preview_export(root=store, run_id=run_id, max_scan_bytes=1)
 
-    assert exc_info.value.code == "trace_scan_incomplete"
+    assert preview["trace_valid"] is True
+    assert preview["scan"]["complete"] is False
+    assert "incomplete_scan" in preview["fail_reasons"]
 
 
 def test_unavailable_file_identity_is_not_certified(tmp_path: Path, monkeypatch):
@@ -610,11 +682,16 @@ def test_unavailable_file_identity_is_not_certified(tmp_path: Path, monkeypatch)
     _run_id, trace_directory = _record(store)
     original_lstat = Path.lstat
 
+    class ZeroInode:
+        def __init__(self, info):
+            self._info = info
+            self.st_ino = 0
+
+        def __getattr__(self, name):
+            return getattr(self._info, name)
+
     def zero_inode(path: Path):
-        info = original_lstat(path)
-        values = list(info)
-        values[1] = 0
-        return os.stat_result(values)
+        return ZeroInode(original_lstat(path))
 
     monkeypatch.setattr(Path, "lstat", zero_inode)
 
@@ -626,8 +703,42 @@ def test_unavailable_file_identity_is_not_certified(tmp_path: Path, monkeypatch)
         remaining_bytes=preview_module.MAX_PREVIEW_TOTAL_BYTES,
     )
 
-    assert result.payload["status"] == "unreadable"
+    assert result.payload["status"] == "identity_unverified"
     assert result.payload["reason"] == "identity_unavailable"
     run_id = trace_directory.name
-    with pytest.raises(ValueError, match="identity is unavailable"):
-        export_run(root=store, run_id=run_id, output_path=tmp_path / "run.zip")
+    bundle = export_run(root=store, run_id=run_id, output_path=tmp_path / "run.zip")
+    assert bundle.exists()
+
+
+def test_nested_artifact_and_parent_failures_are_explicit(tmp_path: Path):
+    store = tmp_path / "store"
+    run_id, trace_directory = _record(store)
+    nested = trace_directory / "nested" / "artifact.log"
+    nested.parent.mkdir()
+    nested.write_text("nested", encoding="utf-8")
+    _add_artifact(trace_directory, "nested", "nested/artifact.log")
+
+    preview = preview_export(root=store, run_id=run_id)
+
+    assert any(file["path"] == "nested/artifact.log" for file in preview["files"])
+
+    _add_artifact(trace_directory, "missing_parent", "absent/file.log")
+    preview = preview_export(root=store, run_id=run_id)
+    missing_parent = next(
+        file for file in preview["files"] if file.get("reason") == "missing_parent"
+    )
+    assert missing_parent["status"] == "unreadable"
+
+
+def test_trace_larger_than_artifact_cap_can_be_previewed(tmp_path: Path):
+    store = tmp_path / "store"
+    run_id, trace_directory = _record(store)
+    trace_path = trace_directory / "trace.json"
+    trace = read_json(trace_path)
+    trace["name"] = "x" * (preview_module.MAX_SCAN_BYTES + 1024)
+    write_json(trace_path, trace)
+
+    preview = preview_export(root=store, run_id=run_id)
+
+    assert preview["trace_valid"] is True
+    assert next(file for file in preview["files"] if file["id"] == "trace")["status"] == "scanned"

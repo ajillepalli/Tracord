@@ -41,6 +41,10 @@ and a later export, file sizes and labels are sensitive metadata, and the rules
 cannot prove that apparently clean content has no secret. Review sensitive
 traces before sharing them.
 
+Symlinks, junctions, and link-like Windows reparse points are rejected. Ordinary
+hardlinks are regular files and remain in scope for scanning and export; do not
+place trace stores in directories writable by untrusted local users.
+
 ## Scope
 
 In scope:

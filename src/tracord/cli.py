@@ -22,6 +22,7 @@ from .export_preview import (
 )
 from .git_capture import DEFAULT_GIT_TIMEOUT_SECONDS, DEFAULT_MAX_DIFF_BYTES
 from .recorder import record_command
+from .redaction import sanitize_label
 from .replay import replay_run
 from .storage import DEFAULT_HOME, list_runs, read_json, run_dir
 
@@ -257,10 +258,12 @@ def handle_export(args: argparse.Namespace) -> int:
             output_path=args.output,
             overwrite=args.overwrite,
         )
-    except (FileExistsError, FileNotFoundError, ValueError) as exc:
-        print(f"tracord: {exc}", file=sys.stderr)
+    except (FileExistsError, FileNotFoundError, OSError, ValueError) as exc:
+        print(f"tracord: {sanitize_label(str(exc))}", file=sys.stderr)
         return 1
-    print(f"exported {args.run_id} {bundle_path}")
+    print(
+        f"exported {sanitize_label(args.run_id)} {sanitize_label(str(bundle_path))}"
+    )
     return 0
 
 
@@ -315,10 +318,10 @@ def write_json_stdout(payload: dict[str, object]) -> None:
 def handle_import(args: argparse.Namespace) -> int:
     try:
         trace = import_bundle(root=Path(args.store), bundle_path=args.bundle, overwrite=args.overwrite)
-    except (FileExistsError, FileNotFoundError, ValueError) as exc:
-        print(f"tracord: {exc}", file=sys.stderr)
+    except (FileExistsError, FileNotFoundError, OSError, ValueError) as exc:
+        print(f"tracord: {sanitize_label(str(exc))}", file=sys.stderr)
         return 1
-    print(f"imported {trace['run_id']}")
+    print(f"imported {sanitize_label(str(trace['run_id']))}")
     return 0
 
 

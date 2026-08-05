@@ -139,7 +139,12 @@ def test_preview_operational_error_uses_exit_one(tmp_path: Path, capsys):
 
     assert exit_code == 1
     captured = capsys.readouterr()
-    assert json.loads(captured.out)["error"] == "run_not_found"
+    error_payload = json.loads(captured.out)
+    assert error_payload == {
+        "preview_version": "tracord.export-preview.v0",
+        "trace_valid": None,
+        "error": "run_not_found",
+    }
     assert captured.err.endswith("run_not_found\n")
     assert not store.exists()
 

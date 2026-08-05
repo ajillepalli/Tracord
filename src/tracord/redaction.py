@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
 
 
 REDACTION = "[REDACTED]"
+MAX_DISPLAY_LABEL_CHARS = 256
 
 
 class ReplacementStrategy(StrEnum):
@@ -171,3 +173,18 @@ def redact_text(value: str) -> str:
             redacted,
         )
     return redacted
+
+
+def sanitize_label(value: str) -> str:
+    """Redact and escape untrusted text before terminal or JSON display."""
+    characters: list[str] = []
+    for character in redact_text(value):
+        category = unicodedata.category(character)
+        if category.startswith("C") or category in {"Zl", "Zp"}:
+            characters.append(f"\\u{ord(character):04x}")
+        else:
+            characters.append(character)
+    sanitized = "".join(characters)
+    if len(sanitized) > MAX_DISPLAY_LABEL_CHARS:
+        return sanitized[:MAX_DISPLAY_LABEL_CHARS] + "...[TRUNCATED]"
+    return sanitized

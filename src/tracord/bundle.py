@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import stat
 import zipfile
 from datetime import UTC, datetime
@@ -11,7 +13,7 @@ from typing import Any
 
 from .paths import is_link_or_junction, safe_join, validate_relative_path
 from .schema import validate_trace
-from .storage import ensure_store, read_json, run_dir, write_json
+from .storage import RUNS_DIR, read_json, run_dir
 
 
 BUNDLE_VERSION = "tracord.bundle.v0"
@@ -29,10 +31,9 @@ def export_run(
     _validate_run_id(run_id)
     source_dir = run_dir(root, run_id)
     _validate_run_directory(source_dir)
-    trace_path = source_dir / TRACE_FILE
-    _validate_export_file(source_dir, TRACE_FILE)
-
-    trace = read_json(trace_path)
+    with _open_export_file(source_dir, TRACE_FILE) as trace_stream:
+        trace_bytes = trace_stream.read()
+    trace = json.loads(trace_bytes.decode("utf-8"))
     errors = validate_trace(trace)
     if errors:
         raise ValueError("trace is invalid: " + "; ".join(errors))
@@ -41,27 +42,26 @@ def export_run(
 
     artifacts = _artifact_names(trace)
     files = [TRACE_FILE, *artifacts]
-    for file_name in files:
-        _validate_export_file(source_dir, file_name)
-
     if output_path is None:
         output_path = Path(f"{run_id}.tracord.zip")
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"bundle already exists: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    manifest = {
-        "bundle_version": BUNDLE_VERSION,
-        "run_id": run_id,
-        "schema_version": trace.get("schema_version"),
-        "created_at": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-        "files": files,
-    }
+    manifest = build_manifest(
+        run_id=run_id,
+        trace=trace,
+        files=files,
+        created_at=datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+    )
 
     with zipfile.ZipFile(output_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(MANIFEST_FILE, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        for file_name in files:
-            archive.write(safe_join(source_dir, file_name), file_name)
+        archive.writestr(TRACE_FILE, trace_bytes)
+        for file_name in artifacts:
+            with _open_export_file(source_dir, file_name) as source:
+                with archive.open(file_name, "w") as target:
+                    shutil.copyfileobj(source, target)
 
     return output_path
 
@@ -75,7 +75,7 @@ def import_bundle(
     if not bundle_path.exists():
         raise FileNotFoundError(f"bundle not found: {bundle_path}")
 
-    ensure_store(root)
+    _ensure_import_runs(root)
     with zipfile.ZipFile(bundle_path) as archive:
         member_names = archive.namelist()
         _validate_members(member_names)
@@ -92,24 +92,47 @@ def import_bundle(
             missing = sorted(expected_files.difference(member_names))
             raise ValueError("bundle is missing expected files: " + ", ".join(missing))
 
-        run_id = str(trace["run_id"])
+        run_id = trace["run_id"]
         _validate_run_id(run_id)
         target_dir = run_dir(root, run_id)
-        if target_dir.exists() and not overwrite:
+        target_exists = target_dir.exists() or target_dir.is_symlink()
+        if target_exists and not overwrite:
             raise FileExistsError(f"run already exists: {run_id}")
-        if target_dir.exists():
+        if target_exists:
+            _validate_run_directory(target_dir)
             _remove_stale_artifacts(target_dir, expected_files, member_names)
-        target_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            target_dir.mkdir()
 
         for file_name in sorted(expected_files):
-            target = safe_join(target_dir, file_name)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(archive.read(file_name))
+            _write_import_file(target_dir, file_name, archive.read(file_name))
 
         if MANIFEST_FILE in member_names:
-            write_json(target_dir / "bundle-manifest.json", json.loads(archive.read(MANIFEST_FILE)))
+            manifest_bytes = (
+                json.dumps(json.loads(archive.read(MANIFEST_FILE)), indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+            _write_import_file(target_dir, "bundle-manifest.json", manifest_bytes)
 
     return trace
+
+
+def build_manifest(
+    *,
+    run_id: str,
+    trace: dict[str, Any],
+    files: list[str],
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    manifest = {
+        "bundle_version": BUNDLE_VERSION,
+        "run_id": run_id,
+        "schema_version": trace.get("schema_version"),
+        "files": files,
+    }
+    if created_at is not None:
+        manifest["created_at"] = created_at
+    return manifest
 
 
 def _validate_run_id(run_id: str) -> None:
@@ -124,6 +147,8 @@ def _validate_run_directory(source_dir: Path) -> None:
         info = source_dir.lstat()
     except FileNotFoundError:
         raise FileNotFoundError("run not found") from None
+    except OSError:
+        raise ValueError("run directory is unreadable") from None
     if (
         is_link_or_junction(source_dir.parent, runs_info)
         or not stat.S_ISDIR(runs_info.st_mode)
@@ -152,8 +177,73 @@ def _validate_export_file(source_dir: Path, relative_path: str) -> None:
         raise FileNotFoundError("run artifact not found") from None
     if is_link_or_junction(candidate, info) or not stat.S_ISREG(info.st_mode):
         raise ValueError("run artifact must be a regular file")
-    if info.st_ino == 0:
-        raise ValueError("run artifact identity is unavailable")
+
+
+def _open_export_file(source_dir: Path, relative_path: str):
+    _validate_export_file(source_dir, relative_path)
+    candidate = safe_join(source_dir, relative_path)
+    initial = candidate.lstat()
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(candidate, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not _same_export_snapshot(initial, opened):
+            raise ValueError("run artifact changed during export")
+        stream = os.fdopen(descriptor, "rb", closefd=True)
+        descriptor = -1
+        return stream
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _same_export_snapshot(first: os.stat_result, second: os.stat_result) -> bool:
+    if first.st_ino and second.st_ino:
+        identity_matches = first.st_ino == second.st_ino and first.st_dev == second.st_dev
+    else:
+        identity_matches = True
+    return (
+        identity_matches
+        and first.st_mode == second.st_mode
+        and first.st_size == second.st_size
+        and first.st_mtime_ns == second.st_mtime_ns
+    )
+
+
+def _ensure_import_runs(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    runs_directory = root / RUNS_DIR
+    if not runs_directory.exists() and not runs_directory.is_symlink():
+        runs_directory.mkdir()
+        return
+    info = runs_directory.lstat()
+    if is_link_or_junction(runs_directory, info) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError("runs directory must be a real directory")
+
+
+def _write_import_file(target_dir: Path, relative_path: str, data: bytes) -> None:
+    target = safe_join(target_dir, relative_path)
+    current = target_dir
+    for part in PurePosixPath(relative_path).parts[:-1]:
+        current /= part
+        if not current.exists() and not current.is_symlink():
+            current.mkdir()
+        info = current.lstat()
+        if is_link_or_junction(current, info) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError("import target parent must be a real directory")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_TRUNC
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(target, flags, 0o600)
+    except OSError:
+        raise ValueError("import target must be a regular file") from None
+    with os.fdopen(descriptor, "wb", closefd=True) as stream:
+        stream.write(data)
 
 
 def _remove_stale_artifacts(

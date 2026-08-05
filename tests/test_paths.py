@@ -34,3 +34,11 @@ def test_windows_mount_point_reparse_tag_is_treated_as_junction(tmp_path: Path):
         st_reparse_tag = 0xA0000003
 
     assert is_link_or_junction(tmp_path, ReparseInfo()) is True
+
+
+def test_non_link_cloud_reparse_tag_is_allowed(tmp_path: Path):
+    class CloudInfo:
+        st_mode = stat.S_IFREG
+        st_reparse_tag = 0x9000001A
+
+    assert is_link_or_junction(tmp_path, CloudInfo()) is False

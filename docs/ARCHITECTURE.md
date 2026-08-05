@@ -47,6 +47,8 @@ output directory, or bundle. Read-only opens can still update access times, and
 cross-platform filesystem races remain a documented best-effort boundary.
 Normal export shares the same run-ID, real-directory, regular-file, and stable
 identity preflight so preview does not certify inputs that the writer rejects.
+Export streams from verified descriptors, while import creates files through
+no-follow descriptors beneath validated real directories.
 
 ## File Change Model
 

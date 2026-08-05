@@ -38,6 +38,9 @@ The preview scans the exact raw bytes of `trace.json`, a projected manifest, and
 every unique artifact referenced by the trace. The projection omits `created_at`
 because that safe timestamp is generated only when export begins. Preview also
 checks adjacent values for secret-named command flags such as `--token VALUE`.
+This covers common suffixes such as token, API key, password, auth, bearer, and
+credential, but remains a best-effort heuristic rather than a complete CLI
+credential grammar.
 It reports rule names and counts only. It never reports
 matched values, excerpts, offsets, lengths, absolute paths, raw filesystem
 exceptions, content hashes, timestamps, or mtimes. Displayed relative paths and
@@ -46,9 +49,10 @@ redaction changes it; `run_id_display` always contains the safe display value.
 Artifact IDs are opaque ordinals over the deterministically sorted path set; they
 never embed rejected or redacted paths and are unique within one preview.
 
-Each file is scanned as text only when it is a regular, non-symlink file and its
+Each artifact is scanned as text only when it is a regular, non-symlink file and its
 bounded read contains no NUL byte. The default per-file limit is 10 MiB. Preview
 also enforces hard limits of 1,024 unique artifacts and 100 MiB read in total.
+`trace.json` may use the aggregate ceiling so large valid traces remain gateable.
 Binary, truncated, missing, unsafe, unreadable, changed, or limit-skipped files
 make scan coverage incomplete. The per-file limit can be lowered but not raised;
 the artifact and aggregate ceilings are intentionally not CLI-configurable.
@@ -66,9 +70,13 @@ reported separately. `--allow-incomplete-scan` opts out of only the incomplete
 coverage failure; it does not suppress live findings, unsafe paths, missing
 files, unreadable files, or an unknown artifact-limit preflight.
 
-JSON always reports `fail_reasons`, even when `gate_enforced` is false and the
+JSON and library results always report `fail_reasons`, even when `gate_enforced` is false and the
 command exits successfully. `export_preflight` is `ready`, `blocked`, or
 `unknown`; `export_would_succeed` is respectively `true`, `false`, or `null`.
+These fields describe source-side readiness only; output-path existence and
+permissions are checked by the later export operation. When the artifact limit
+is exceeded, `files_total_is_lower_bound` is true rather than claiming an exact
+count for entries that were intentionally not collected.
 Operational failures in JSON mode emit a minimal object containing
 `preview_version`, `trace_valid`, and a fixed `error` code.
 
@@ -89,11 +97,18 @@ Preview describes files at scan time. A later export can observe changed files,
 so a clean preview is not proof that a later bundle is safe. On Windows,
 `O_NOFOLLOW` is unavailable; path and descriptor identity checks compensate but
 cannot make cross-platform races impossible. Windows junctions and other reparse
-points are rejected from `st_reparse_tag`, including on Python 3.11 where
+link-like reparse points are rejected from `st_reparse_tag`, including on Python 3.11 where
 `Path.is_junction()` is unavailable. On POSIX, no-follow protects the
 final component, while a hostile parent-directory replacement remains a residual
 race. Filesystems that do not provide stable inode identity are reported as
 unreadable. Read-only opens can update file access times on some filesystems.
+When inode identity is unavailable, preview scans with mode/size/mtime checks,
+marks coverage incomplete as `identity_unverified`, and leaves export possible.
+
+Normal export streams each source through the same descriptor used for its
+snapshot verification. Import rejects linked run directories and parents and
+writes members through no-follow descriptors. Hardlinks remain regular files and
+are intentionally out of scope for link rejection.
 
 Output includes exact file sizes, which are sensitive metadata. Do not publish
 preview JSON for private traces. Content hashes are intentionally omitted because

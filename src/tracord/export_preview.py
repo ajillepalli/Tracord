@@ -6,19 +6,18 @@ import json
 import os
 import re
 import stat
-import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .bundle import BUNDLE_VERSION, MANIFEST_FILE, TRACE_FILE
+from .bundle import BUNDLE_VERSION, MANIFEST_FILE, TRACE_FILE, build_manifest
 from .paths import is_link_or_junction, validate_relative_path
 from .redaction import (
     REDACTION,
     RedactionSummary,
     RuleRedactionSummary,
-    redact_text,
+    sanitize_label,
     summarize_redactions,
 )
 from .schema import validate_trace
@@ -27,19 +26,20 @@ from .storage import RUNS_DIR, run_dir
 
 PREVIEW_VERSION = "tracord.export-preview.v0"
 DEFAULT_MAX_SCAN_BYTES = 10 * 1024 * 1024
+MAX_SCAN_BYTES = 10 * 1024 * 1024
 MAX_PREVIEW_ARTIFACTS = 1024
 MAX_PREVIEW_TOTAL_BYTES = 100 * 1024 * 1024
+MAX_TRACE_SCAN_BYTES = MAX_PREVIEW_TOTAL_BYTES
 MAX_TEXT_FILE_ENTRIES = 50
 
 _SECRET_CLI_FLAG = re.compile(
-    r"(?i)^--(?:api[-_]?key|token|secret|password)$"
+    r"(?i)^--?(?:[a-z0-9]+[-_])*(?:token|api[-_]?key|secret|password|passwd|pwd|auth|bearer|credential)$"
 )
 
 _EXPORT_BLOCKING_STATUSES = {
     "missing",
     "unsafe_path",
     "unreadable",
-    "file_limit",
 }
 
 
@@ -77,7 +77,7 @@ def preview_export(
         source_dir=source_dir,
         relative_path=TRACE_FILE,
         file_id="trace",
-        max_scan_bytes=max_scan_bytes,
+        max_scan_bytes=min(MAX_TRACE_SCAN_BYTES, max_total_scan_bytes),
         remaining_bytes=remaining_bytes,
     )
     if trace_result.payload["status"] == "missing":
@@ -87,14 +87,14 @@ def preview_export(
 
     try:
         trace = json.loads(trace_result.data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
         raise ExportPreviewError("invalid_trace_json") from None
     if not isinstance(trace, dict) or validate_trace(trace):
         raise ExportPreviewError("invalid_trace")
     if trace.get("run_id") != run_id:
         raise ExportPreviewError("trace_run_id_mismatch")
 
-    command_summary = _summarize_command_secrets(trace.get("command"))
+    command_summary = _summarize_all_command_secrets(trace)
     if command_summary.findings_total or command_summary.already_redacted_total:
         trace_result.summary = _combine_summaries(
             [summary for summary in (trace_result.summary, command_summary) if summary]
@@ -107,28 +107,29 @@ def preview_export(
     summaries = [trace_result.summary] if trace_result.summary is not None else []
     bytes_read = trace_result.bytes_read
 
-    manifest_text = json.dumps(
-        {
-            "bundle_version": BUNDLE_VERSION,
-            "run_id": run_id,
-            "schema_version": trace.get("schema_version"),
-        },
-        sort_keys=True,
+    projected_files = [TRACE_FILE, *artifact_names]
+    manifest = build_manifest(run_id=run_id, trace=trace, files=projected_files)
+    manifest_text = json.dumps(manifest, sort_keys=True)
+    manifest_data = manifest_text.encode("utf-8")
+    manifest_bytes = len(manifest_data)
+    manifest_scan_bytes = min(manifest_bytes, remaining_bytes)
+    manifest_summary = summarize_redactions(
+        manifest_data[:manifest_scan_bytes].decode("utf-8")
     )
-    manifest_summary = summarize_redactions(manifest_text)
-    manifest_bytes = len(manifest_text.encode("utf-8"))
+    manifest_status = "scanned" if manifest_scan_bytes == manifest_bytes else "aggregate_limit"
     files.append(
         _file_payload(
             file_id="manifest",
             path=MANIFEST_FILE,
-            status="scanned",
-            reason=None,
+            status=manifest_status,
+            reason=None if manifest_status == "scanned" else "aggregate_limit",
             size_bytes=None,
-            scanned_bytes=manifest_bytes,
+            scanned_bytes=manifest_scan_bytes,
             summary=manifest_summary,
         )
     )
     summaries.append(manifest_summary)
+    remaining_bytes = max(0, remaining_bytes - manifest_scan_bytes)
 
     for index, relative_path in enumerate(artifact_names):
         result = _scan_file(
@@ -175,7 +176,7 @@ def preview_export(
 
     scan_complete = fully_scanned == files_total
     known_export_blocker = any(
-        file["status"] in _EXPORT_BLOCKING_STATUSES - {"file_limit"} for file in files
+        file["status"] in _EXPORT_BLOCKING_STATUSES for file in files
     )
     if known_export_blocker:
         export_preflight = "blocked"
@@ -187,10 +188,10 @@ def preview_export(
         export_preflight = "ready"
         export_would_succeed = True
 
-    return {
+    preview = {
         "preview_version": PREVIEW_VERSION,
-        "run_id": run_id if _sanitize_label(run_id) == run_id else None,
-        "run_id_display": _sanitize_label(run_id),
+        "run_id": run_id if sanitize_label(run_id) == run_id else None,
+        "run_id_display": sanitize_label(run_id),
         "bundle_version": BUNDLE_VERSION,
         "trace_valid": True,
         "export_preflight": export_preflight,
@@ -213,8 +214,12 @@ def preview_export(
         },
         "findings": aggregate_findings,
         "files": files,
+        "files_total_is_lower_bound": artifact_limit_exceeded,
+        "gate_enforced": False,
         "fail_reasons": [],
     }
+    preview["fail_reasons"] = gate_reasons(preview)
+    return preview
 
 
 def gate_reasons(
@@ -253,7 +258,7 @@ def _validate_options(
         raise ExportPreviewError("invalid_run_id")
     if (
         max_scan_bytes <= 0
-        or max_scan_bytes > DEFAULT_MAX_SCAN_BYTES
+        or max_scan_bytes > MAX_SCAN_BYTES
         or max_artifacts <= 0
         or max_artifacts > MAX_PREVIEW_ARTIFACTS
         or max_total_scan_bytes <= 0
@@ -299,7 +304,7 @@ def _scan_file(
             )
         )
 
-    display_path = _sanitize_label(relative_path)
+    display_path = sanitize_label(relative_path)
     candidate = source_dir.joinpath(*PurePosixPath(relative_path).parts)
     containment = _check_containment(source_dir, candidate)
     if containment is not None:
@@ -352,7 +357,7 @@ def _scan_file(
                 path=display_path,
                 status="unreadable",
                 reason="symlink",
-                size_bytes=size,
+                size_bytes=None,
             )
         )
     if not stat.S_ISREG(initial.st_mode):
@@ -365,16 +370,7 @@ def _scan_file(
                 size_bytes=size,
             )
         )
-    if initial.st_ino == 0:
-        return _ScanResult(
-            _empty_file_payload(
-                file_id=file_id,
-                path=display_path,
-                status="unreadable",
-                reason="identity_unavailable",
-                size_bytes=size,
-            )
-        )
+    identity_unavailable = initial.st_ino == 0
     if remaining_bytes <= 0:
         return _ScanResult(
             _empty_file_payload(
@@ -413,8 +409,9 @@ def _scan_file(
                     size_bytes=size,
                 )
             )
-        stream_descriptor, descriptor = descriptor, -1
-        with os.fdopen(stream_descriptor, "rb", closefd=True) as stream:
+        stream = os.fdopen(descriptor, "rb", closefd=True)
+        descriptor = -1
+        with stream:
             data = stream.read(read_limit)
             final_descriptor = os.fstat(stream.fileno())
     except OSError:
@@ -479,6 +476,9 @@ def _scan_file(
     if size > read_limit:
         status = "truncated" if read_limit == max_scan_bytes else "aggregate_limit"
         reason = "aggregate_limit" if status == "aggregate_limit" else "max_scan_bytes"
+    elif identity_unavailable:
+        status = "identity_unverified"
+        reason = "identity_unavailable"
     else:
         status = "scanned"
         reason = None
@@ -512,22 +512,10 @@ def _validate_run_directory(root: Path, source_dir: Path) -> None:
         raise ExportPreviewError("run_directory_unsafe")
 
 
-def _sanitize_label(value: str) -> str:
-    redacted = redact_text(value)
-    characters: list[str] = []
-    for character in redacted:
-        category = unicodedata.category(character)
-        if category.startswith("C") or category in {"Zl", "Zp"}:
-            characters.append(f"\\u{ord(character):04x}")
-        else:
-            characters.append(character)
-    return "".join(characters)
-
-
-def _summarize_command_secrets(command: object) -> RedactionSummary:
+def _summarize_all_command_secrets(trace: object) -> RedactionSummary:
     findings = 0
     already_redacted = 0
-    if isinstance(command, list):
+    for command in _string_lists(trace):
         for index, argument in enumerate(command[:-1]):
             if not isinstance(argument, str) or not _SECRET_CLI_FLAG.fullmatch(argument):
                 continue
@@ -555,6 +543,17 @@ def _summarize_command_secrets(command: object) -> RedactionSummary:
         advisory_total=0,
         already_redacted_total=already_redacted,
     )
+
+
+def _string_lists(value: object):
+    if isinstance(value, list):
+        if value and all(isinstance(item, str) for item in value):
+            yield value
+        for item in value:
+            yield from _string_lists(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _string_lists(item)
 
 
 def _combine_summaries(summaries: list[RedactionSummary]) -> RedactionSummary:
@@ -604,6 +603,8 @@ def _check_parent_components(source_dir: Path, relative_path: str) -> str | None
 
 
 def _same_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    if first.st_ino == 0 or second.st_ino == 0:
+        return True
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
 
