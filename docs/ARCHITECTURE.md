@@ -39,6 +39,19 @@ The current trace contract is `tracord.trace.v0`. A command trace has:
 
 See [trace-v0.md](trace-v0.md) and [../schemas/trace-v0.schema.json](../schemas/trace-v0.schema.json).
 
+Trace-v0 reserves protocol-neutral `tool.call.started` and
+`tool.call.finished` events. JSON Schema owns each event's closed `data` and
+capture-object structure. The Python validator first validates every event's
+structure, then performs a linear second pass over call identifiers to enforce
+start/finish ordering and uniqueness. Unknown event names retain the open v0
+envelope, so adapters can add events without a top-level schema change.
+
+Capture declarations make stored input and output handling explicit but do not
+perform capture or redaction. Runner and MCP adapters remain responsible for
+policy, redaction, and translating protocol-specific failures into stable,
+low-cardinality classifications. Tool outcomes do not determine the enclosing
+command status.
+
 ## Bundle Model
 
 Portable bundles are zip archives with a `.tracord.zip` suffix. Import rejects unsafe paths and writes only under the target run directory.
@@ -171,5 +184,5 @@ cross-platform race windows.
 
 ## Near-Term Direction
 
-- Add model-call and tool-call event types.
+- Add model-call event types.
 - Add adapters for common agent runners and MCP tools.

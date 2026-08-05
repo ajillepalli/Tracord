@@ -27,17 +27,127 @@ Every event has:
 - `at`: UTC ISO-8601 timestamp.
 - `data`: event-specific object.
 
-The initial command recorder emits:
+The command recorder emits:
 
 - `command.started`
 - `command.finished`
 - `file.diff` when Git file-change capture is requested
 
-Future event types should be additive and should not require changing the top-level trace shape.
+Unknown event types remain additive and keep the open event envelope. Tracord
+reserves only the exact names `tool.call.started` and `tool.call.finished` for
+the tool-call contract below; names such as `tool.call.progress` remain unknown
+and open.
+
+### Tool calls
+
+`tool.call.started` records a protocol-neutral call identifier, tool name, and
+input capture declaration:
+
+```json
+{
+  "type": "tool.call.started",
+  "at": "2026-08-05T12:00:00Z",
+  "data": {
+    "call_id": "call-1",
+    "name": "get_weather",
+    "input": {
+      "capture": "captured",
+      "value": {"location": "New York"}
+    }
+  }
+}
+```
+
+`data` has exactly `call_id`, `name`, and `input`. Both identifiers are 1-512
+characters, exclude C0/C1 control characters, and are not trimmed or
+normalized. Spaces and protocol-specific printable characters remain valid.
+`input` has one of these exact shapes:
+
+- `{"capture": "captured", "value": {...}}` stores the input object as supplied.
+- `{"capture": "redacted", "value": {...}}` declares that the producer changed at least one sensitive value.
+- `{"capture": "omitted"}` stores no input value.
+
+Captured and redacted input values must be JSON objects. An argument-free call
+uses an empty captured object. `captured` does not mean secret-free, and the
+schema cannot prove that a redacted value is safe.
+
+`tool.call.finished` records the result independently from the input capture
+choice:
+
+```json
+{
+  "type": "tool.call.finished",
+  "at": "2026-08-05T12:00:01Z",
+  "data": {
+    "call_id": "call-1",
+    "outcome": "succeeded",
+    "duration_ms": 1000,
+    "output": {
+      "capture": "redacted",
+      "value": {"content": "[REDACTED]"}
+    }
+  }
+}
+```
+
+`data` has exactly `call_id`, `outcome`, `duration_ms`, `output`, and the
+conditional `error_type` field. Outcomes are `succeeded`, `failed`,
+`cancelled`, and `timeout`. Duration is a non-negative JSON integer no greater
+than `2^53 - 1`; mathematically integral forms such as `1.0` are valid, while
+booleans and fractions are not.
+
+Output capture uses the same three declarations as input. Captured and redacted
+outputs require the `value` key, but its value may be any JSON value, including
+`null`, `false`, `0`, an empty string, array, or object. Omitted output forbids
+the `value` key.
+
+A failed call requires `error_type`; every other outcome forbids it:
+
+```json
+{
+  "type": "tool.call.finished",
+  "at": "2026-08-05T12:00:01Z",
+  "data": {
+    "call_id": "call-1",
+    "outcome": "failed",
+    "duration_ms": 1000,
+    "output": {"capture": "omitted"},
+    "error_type": "Tool.ExecutionFailed"
+  }
+}
+```
+
+`error_type` is 1-64 ASCII characters. Its first character is a letter; every
+remaining character is a letter, digit, underscore, period, or hyphen.
+Producers should keep it low-cardinality and must not place raw exception text,
+paths, arguments, or results in it.
+
+Tool-call lifecycle is evaluated in event-array order, not timestamp order:
+
+- A start identifier is unique within its trace.
+- A finish references an earlier start and may occur once.
+- Concurrent calls may interleave and finish in any order.
+- A start with no finish is valid and represents an interrupted trace.
+- An orphan or early finish, duplicate start, or duplicate finish is invalid.
+- Event timestamps need not be monotonic.
+- Tool outcome does not constrain the command trace's top-level status; an agent may recover from a failed call.
+
+Known tool-call `data`, `input`, and `output` objects reject unknown fields. The
+outer event envelope stays open. The Python validator checks all event structure
+before lifecycle; lifecycle diagnostics are withheld until every event envelope
+and known shape passes so structural errors have deterministic precedence. The
+validator emits index-based errors that do not echo tool names, identifiers,
+arguments, results, or error classifications. Consumers of raw third-party JSON
+Schema diagnostics must sanitize them separately.
+
+The Python validator applies the trace-wide numeric and nesting limits described
+below to captured values. JSON Schema enforces event structure only and cannot
+by itself enforce Tracord's recursive container or JSON-safe-number bounds.
 
 Safe trace readers reject JSON with more than 256 simultaneously open
 containers, including the root. This canonical bound applies to list, inspect,
-replay, and assertions.
+replay, assertions, and captured tool values. All numbers must be finite;
+integers must remain within `-(2^53 - 1)` through `2^53 - 1`.
 
 ## Artifacts
 
