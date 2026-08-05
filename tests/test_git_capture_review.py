@@ -122,6 +122,39 @@ def test_repository_assertions_are_captured_but_runtime_stores_are_not(
     ]
 
 
+def test_capture_preserves_configured_global_ignores(tmp_path: Path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    global_ignore = tmp_path / "global-ignore"
+    global_ignore.write_text("*.pem\n", encoding="utf-8")
+    _git(repo, "config", "core.excludesFile", str(global_ignore))
+    secret = repo / "private.pem"
+    secret.write_text("before-secret\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    trace = record_command(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                "Path('tracked.txt').write_text('changed'); "
+                "Path('private.pem').write_text('after-secret')"
+            ),
+        ],
+        root=repo / ".tracord",
+        capture_diff=True,
+    )
+
+    assert trace["file_changes"]["files"] == [
+        {"status": "M", "path": "tracked.txt"}
+    ]
+    patch = (
+        run_dir(repo / ".tracord", str(trace["run_id"])) / "changes.patch"
+    ).read_text(encoding="utf-8")
+    assert "private.pem" not in patch
+    assert "after-secret" not in patch
+
+
 def test_capture_excludes_only_the_active_store_runtime(tmp_path: Path, monkeypatch):
     repo = _init_repo(tmp_path)
     foreign_runtime = repo / "nested" / ".tracord" / "runs" / "fixture.txt"
