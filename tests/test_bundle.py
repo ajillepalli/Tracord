@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import tracord.bundle as bundle_module
+import tracord.recorder as recorder_module
 from tracord.bundle import export_run, import_bundle
 from tracord.cli import main
 from tracord.recorder import record_command
@@ -471,7 +472,12 @@ def test_import_rejects_nonportable_run_ids(tmp_path: Path, run_id: str):
         import_bundle(root=tmp_path / "target", bundle_path=bundle)
 
 
-def test_import_rejects_case_alias_of_existing_run(tmp_path: Path):
+def test_import_rejects_case_alias_of_existing_run(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        recorder_module,
+        "new_run_id",
+        lambda: "20260805T000000-abcdef12",
+    )
     source = tmp_path / "source"
     trace = record_command([sys.executable, "-c", "print('safe')"], root=source)
     bundle = export_run(
