@@ -49,6 +49,8 @@ def valid_trace(tmp_path: Path, *, run_id: str = RUN_ID) -> dict[str, object]:
         "exit_code": 0,
         "timed_out": False,
         "redacted": True,
+        "decode_replacement": {"stdout": "none", "stderr": "none"},
+        "store_identity_verified": True,
         "artifacts": {"stdout": "stdout.log", "stderr": "stderr.log"},
         "events": [
             {
@@ -111,6 +113,31 @@ def test_scanner_constants_are_frozen():
     assert READ_CHUNK_BYTES == 1024 * 1024
     assert MAX_NEEDLE_BYTES == 65_536
     assert TAIL_BYTES == 65_535
+
+
+@pytest.mark.parametrize(
+    ("replacement", "expected_code"),
+    [
+        (None, "artifact_decode_unknown"),
+        ("present", "artifact_decode_replaced"),
+    ],
+)
+def test_content_assertions_are_indeterminate_when_decode_provenance_is_lossy_or_unknown(
+    tmp_path: Path,
+    replacement: str | None,
+    expected_code: str,
+):
+    root = tmp_path / ".tracord"
+    trace, trace_dir = _write_run(root, stdout=b"needle\n")
+    if replacement is None:
+        trace.pop("decode_replacement")
+    else:
+        trace["decode_replacement"] = {"stdout": replacement, "stderr": "none"}
+    (trace_dir / "trace.json").write_text(json.dumps(trace), encoding="utf-8")
+
+    assert _failures(root, TraceExpectations(stdout_contains="needle")) == [
+        AssertionFailure(expected_code, "stdout_contains")
+    ]
 
 
 def test_snapshot_comparison_is_tri_state_and_nonidentity_first(tmp_path: Path):

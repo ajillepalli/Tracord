@@ -23,6 +23,13 @@ from .paths import (
     prepare_regular_file,
     verify_opened_file,
 )
+from .result_codes import (
+    ASSERTION_EXPECTATION_LOCATIONS,
+    ASSERTION_FAILURE_CODES,
+    ASSERTION_RUN_ERROR_CODES,
+    ASSERTION_VALIDATION_ERROR_CODES,
+    DECODE_REPLACEMENT_STATES,
+)
 from .schema import STATUSES, validate_trace
 from .storage import RUNS_DIR
 
@@ -34,44 +41,11 @@ READ_CHUNK_BYTES = 1024 * 1024
 MAX_NEEDLE_BYTES = 65_536
 TAIL_BYTES = MAX_NEEDLE_BYTES - 1
 MAX_JSON_INTEGER_DIGITS = 128
-_EXPECTATION_LOCATIONS = frozenset(
-    {
-        "status",
-        "exit_code",
-        "stdout_contains",
-        "stderr_contains",
-        "max_duration_ms",
-        "no_timeout",
-    }
-)
-_RUN_ERROR_CODES = frozenset(
-    {
-        "invalid_run_id",
-        "run_not_found",
-        "trace_unreadable",
-        "trace_invalid",
-        "run_identity_mismatch",
-    }
-)
-_FAILURE_CODES = frozenset(
-    {
-        "artifact_unreadable",
-        "artifact_invalid_utf8",
-        "artifact_changed",
-        "assertion_mismatch",
-        "scan_incomplete",
-    }
-)
-_VALIDATION_CODES = frozenset(
-    {"assertion_value_invalid", "assertion_no_expectations"}
-)
-
-
 class ExpectationValidationError(ValueError):
     """A fixed-code expectation construction error."""
 
     def __init__(self, code: str) -> None:
-        if code not in _VALIDATION_CODES:
+        if code not in ASSERTION_VALIDATION_ERROR_CODES:
             raise ValueError("unknown expectation validation code")
         self.code = code
         super().__init__(code)
@@ -81,9 +55,9 @@ class AssertionRunError(ValueError):
     """A fixed-code run evaluation error."""
 
     def __init__(self, code: str, location: str | None = None) -> None:
-        if code not in _RUN_ERROR_CODES:
+        if code not in ASSERTION_RUN_ERROR_CODES:
             raise ValueError("unknown assertion run error code")
-        if location is not None and location not in _EXPECTATION_LOCATIONS:
+        if location is not None and location not in ASSERTION_EXPECTATION_LOCATIONS:
             raise ValueError("unsafe assertion run error location")
         self.code = code
         self.location = location
@@ -96,9 +70,9 @@ class AssertionFailure:
     location: str
 
     def __post_init__(self) -> None:
-        if self.code not in _FAILURE_CODES:
+        if self.code not in ASSERTION_FAILURE_CODES:
             raise ValueError("unknown assertion failure code")
-        if self.location not in _EXPECTATION_LOCATIONS:
+        if self.location not in ASSERTION_EXPECTATION_LOCATIONS:
             raise ValueError("unsafe assertion failure location")
 
 
@@ -253,6 +227,7 @@ def evaluate_run(
         failures.append(AssertionFailure("assertion_mismatch", "exit_code"))
 
     artifacts = trace.get("artifacts")
+    replacement = trace.get("decode_replacement")
     remaining_bytes = MAX_TOTAL_ARTIFACT_BYTES
     stdout_failure, stdout_read = _contains_failure(
         artifacts.get("stdout") if isinstance(artifacts, Mapping) else None,
@@ -260,6 +235,7 @@ def evaluate_run(
         label="stdout",
         expected=validated.stdout_needle,
         remaining_bytes=remaining_bytes,
+        decode_replacement=_decode_replacement_state(replacement, "stdout"),
     )
     remaining_bytes -= stdout_read
     if stdout_failure is not None:
@@ -271,6 +247,7 @@ def evaluate_run(
         label="stderr",
         expected=validated.stderr_needle,
         remaining_bytes=remaining_bytes,
+        decode_replacement=_decode_replacement_state(replacement, "stderr"),
     )
     if stderr_failure is not None:
         failures.append(stderr_failure)
@@ -438,10 +415,15 @@ def _contains_failure(
     label: str,
     expected: bytes | None,
     remaining_bytes: int,
+    decode_replacement: str,
 ) -> tuple[AssertionFailure | None, int]:
     location = f"{label}_contains"
     if expected is None:
         return None, 0
+    if decode_replacement == "present":
+        return AssertionFailure("artifact_decode_replaced", location), 0
+    if decode_replacement == "unknown":
+        return AssertionFailure("artifact_decode_unknown", location), 0
     if not isinstance(artifact_name, str) or not artifact_name:
         return AssertionFailure("artifact_unreadable", location), 0
     if remaining_bytes <= 0:
@@ -515,6 +497,17 @@ def _contains_failure(
     if not scan_complete:
         return AssertionFailure("scan_incomplete", location), bytes_read
     return AssertionFailure("assertion_mismatch", location), bytes_read
+
+
+def _decode_replacement_state(value: object, label: str) -> str:
+    if value is None:
+        return "unknown"
+    if not isinstance(value, Mapping):
+        raise AssertionRunError("trace_invalid")
+    state = value.get(label)
+    if state not in DECODE_REPLACEMENT_STATES:
+        raise AssertionRunError("trace_invalid")
+    return state
 
 
 def _read_exact(stream: object, size: int) -> tuple[bytes, bool]:

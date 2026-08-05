@@ -65,6 +65,16 @@ ASSERTION_EXPECTATION_LOCATIONS = frozenset(
         "no_timeout",
     }
 )
+ASSERTION_ERROR_LOCATION_PATTERN = (
+    r"(?:status|exit_code|stdout_contains|stderr_contains|max_duration_ms|no_timeout|"
+    r"schema_version|cases(?:\.[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+    r"(?:\.(?:status|exit_code|stdout_contains|stderr_contains|max_duration_ms|"
+    r"no_timeout))?)?)"
+)
+ASSERTION_ERROR_LOCATION_SCHEMA_PATTERN = (
+    rf"^(?:{ASSERTION_ERROR_LOCATION_PATTERN})(?![\s\S])"
+)
+ASSERTION_ERROR_LOCATION = re.compile(ASSERTION_ERROR_LOCATION_PATTERN, re.ASCII)
 ASSERTION_FILE_ERROR_CODES = frozenset(
     {
         "assertion_file_missing",
@@ -147,4 +157,3 @@ FILE_CHANGE_REASONS = frozenset(
 DECODE_REPLACEMENT_STATES = frozenset({"none", "present", "unknown"})
 
 JSON_OUTPUT_FAILURE_EXIT_CODE = 4
-

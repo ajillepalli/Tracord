@@ -12,6 +12,7 @@ from typing import Any, BinaryIO
 
 from . import assertions, paths
 from .assertions import TraceExpectations
+from .result_codes import ASSERTION_FILE_ERROR_CODES
 
 
 ASSERTION_FILE_VERSION = "tracord.assertions.v0"
@@ -31,21 +32,7 @@ _EXPECTATION_FIELDS = (
     "no_timeout",
 )
 _TOP_LEVEL_FIELDS = ("schema_version", "cases")
-_ERROR_CODES = frozenset(
-    {
-        "assertion_file_missing",
-        "assertion_file_unreadable",
-        "assertion_file_not_regular",
-        "assertion_file_changed",
-        "assertion_file_too_large",
-        "assertion_file_bom",
-        "assertion_file_invalid_utf8",
-        "assertion_file_duplicate_key",
-        "assertion_file_invalid_json",
-        "assertion_file_schema_invalid",
-        "case_not_found",
-    }
-)
+_ERROR_CODES = ASSERTION_FILE_ERROR_CODES
 _SAFE_LOCATION = re.compile(
     r"(?:schema_version|cases(?:\.[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
     r"(?:\.(?:status|exit_code|stdout_contains|stderr_contains|max_duration_ms|no_timeout))?)?)",
