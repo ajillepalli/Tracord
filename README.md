@@ -26,7 +26,7 @@ The current MVP includes:
 - **Command recording** - wrap a local command and capture status, timing, stdout, stderr, and trace metadata.
 - **Git file-change capture** - opt in to an isolated before/after working-tree diff with structured file metadata.
 - **Trace contract** - `tracord.trace.v0`, documented in [docs/trace-v0.md](docs/trace-v0.md) with a JSON Schema in [schemas/trace-v0.schema.json](schemas/trace-v0.schema.json).
-- **Deterministic assertions** - check status, exit code, timeout behavior, duration, and artifact contents.
+- **Repository assertions** - check status, exit code, timeout behavior, duration, and artifact contents from versioned, reviewable cases.
 - **Portable bundles** - export and import `.tracord.zip` bundles with path traversal protections.
 - **Safe export preview** - inspect bundle contents with count-only secret findings and a strict CI gate before writing.
 - **Replay** - re-run the command from a recorded trace and store the replay as a new run.
@@ -60,6 +60,7 @@ tracord record --capture-diff -- python agent.py
 tracord list
 tracord inspect <run-id>
 tracord assert <run-id> --status passed --stdout-contains tracord
+tracord assert <run-id> --case smoke
 tracord export <run-id> --preview
 tracord export <run-id> --preview --json --fail-on-findings
 tracord export <run-id> --output hello.tracord.zip
@@ -67,7 +68,48 @@ tracord import hello.tracord.zip
 tracord replay <run-id>
 ```
 
-Recorded runs are stored locally under `.tracord/runs/`. Exported bundles are zip archives with a `.tracord.zip` suffix.
+Recorded runs are stored locally under `.tracord/runs/`. Repository assertion
+cases live in `.tracord/assertions.json`, which is intentionally not ignored by
+Git. Exported bundles are zip archives with a `.tracord.zip` suffix.
+
+## Repository assertion files
+
+The `tracord.assertions.v0` format stores named deterministic checks alongside
+the repository:
+
+```json
+{
+  "schema_version": "tracord.assertions.v0",
+  "cases": {
+    "smoke": {
+      "status": "passed",
+      "exit_code": 0,
+      "stdout_contains": "ready",
+      "no_timeout": true
+    }
+  }
+}
+```
+
+`tracord assert <run-id> --case smoke` loads the default file from the selected
+store. `--file PATH` selects another file, requires `--case`, and resolves a
+relative path from the current directory. File mode cannot be mixed with inline
+expectation flags. Both modes require at least one expectation.
+
+Assertion files are strict UTF-8 JSON and are limited to 1 MiB and 256 cases.
+Case names use portable ASCII letters, digits, `.`, `_`, and `-`, are unique
+under ASCII case folding, and contain at most 128 characters. Containment values
+are limited to 65,536 UTF-8 bytes. Evaluation reads `trace.json` through a
+bounded 16 MiB descriptor and scans regular, single-link stdout and stderr
+artifacts with 10 MiB per-file and 16 MiB aggregate coverage. A positive match
+within verified coverage passes that field; a negative result that reaches a
+coverage limit reports `scan_incomplete` rather than a plain mismatch.
+
+Assertion commands return `0` when every expectation passes, `1` for a trace or
+expectation failure, and `2` for invalid mode, values, files, or case selection.
+Diagnostics use fixed codes and do not echo assertion contents, paths, run IDs,
+unvalidated case input, or raw filesystem errors. Validated repository case
+names may appear only inside bounded logical schema locations.
 
 File diff capture is opt-in because patches may contain sensitive source and data. See [docs/file-diff-capture.md](docs/file-diff-capture.md) for scope, redaction behavior, and limits.
 
@@ -93,7 +135,8 @@ tests/                    # unit tests
 docs/                     # architecture, roadmap, trace and bundle docs
 schemas/                  # machine-readable trace schemas
 .github/                  # issue templates and PR checklist
-.tracord/                 # local run store, ignored by Git
+.tracord/assertions.json  # repository-owned assertion cases
+.tracord/runs/            # local runtime store, ignored by Git
 ```
 
 ## Contributing

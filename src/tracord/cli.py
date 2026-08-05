@@ -11,8 +11,15 @@ from pathlib import Path
 from typing import cast
 
 from . import __version__
-from .assertions import TraceExpectations, evaluate_trace
-from .bundle import export_run, import_bundle
+from .assertion_files import AssertionFileError, load_assertion_case
+from .assertions import (
+    AssertionRunError,
+    ExpectationValidationError,
+    TraceExpectations,
+    evaluate_run,
+    validate_expectations,
+)
+from .bundle import export_run, import_bundle, validate_run_id
 from .export_preview import (
     DEFAULT_MAX_SCAN_BYTES,
     ExportPreviewError,
@@ -79,6 +86,8 @@ def build_parser() -> argparse.ArgumentParser:
     assert_cmd.add_argument("--stderr-contains")
     assert_cmd.add_argument("--max-duration-ms", type=int)
     assert_cmd.add_argument("--no-timeout", action="store_true")
+    assert_cmd.add_argument("--case", dest="case_name", help="repository assertion case")
+    assert_cmd.add_argument("--file", type=Path, help="assertion file path")
     assert_cmd.set_defaults(handler=handle_assert)
 
     export_cmd = subparsers.add_parser("export", help="export a run as a portable bundle")
@@ -181,27 +190,67 @@ def handle_inspect(args: argparse.Namespace) -> int:
 
 
 def handle_assert(args: argparse.Namespace) -> int:
-    trace_directory = run_dir(Path(args.store), args.run_id)
-    path = trace_directory / "trace.json"
-    if not path.exists():
-        print(f"tracord: run not found: {args.run_id}", file=sys.stderr)
-        return 1
-
-    expectations = TraceExpectations(
-        status=args.status,
-        exit_code=args.exit_code,
-        stdout_contains=args.stdout_contains,
-        stderr_contains=args.stderr_contains,
-        max_duration_ms=args.max_duration_ms,
-        no_timeout=args.no_timeout,
+    inline_values = (
+        args.status,
+        args.exit_code,
+        args.stdout_contains,
+        args.stderr_contains,
+        args.max_duration_ms,
+        args.no_timeout,
     )
-    failures = evaluate_trace(read_json(path), trace_dir=trace_directory, expectations=expectations)
+    file_mode = args.case_name is not None or args.file is not None
+    if args.file is not None and args.case_name is None:
+        return _assert_error("assertion_mode_conflict", exit_code=2)
+    if file_mode and any(value is not None and value is not False for value in inline_values):
+        return _assert_error("assertion_mode_conflict", exit_code=2)
+
+    try:
+        validate_run_id(args.run_id)
+    except ValueError:
+        return _assert_error("invalid_run_id", exit_code=2)
+
+    if file_mode:
+        assertion_path = args.file or (Path(args.store) / "assertions.json")
+        try:
+            expectations = load_assertion_case(assertion_path, args.case_name)
+        except AssertionFileError as exc:
+            return _assert_error(exc.code, exit_code=2, location=exc.location)
+    else:
+        expectations = TraceExpectations(
+            status=args.status,
+            exit_code=args.exit_code,
+            stdout_contains=args.stdout_contains,
+            stderr_contains=args.stderr_contains,
+            max_duration_ms=args.max_duration_ms,
+            no_timeout=args.no_timeout,
+        )
+        try:
+            validate_expectations(expectations)
+        except ExpectationValidationError as exc:
+            return _assert_error(exc.code, exit_code=2)
+
+    try:
+        on_disk_run_id, failures = evaluate_run(
+            Path(args.store), args.run_id, expectations
+        )
+    except AssertionRunError as exc:
+        return _assert_error(
+            exc.code,
+            exit_code=2 if exc.code == "invalid_run_id" else 1,
+            location=exc.location,
+        )
     if failures:
         for failure in failures:
-            print(f"fail: {failure}", file=sys.stderr)
+            _assert_error(failure.code, exit_code=1, location=failure.location)
         return 1
-    print(f"pass {args.run_id}")
+    print(f"pass {sanitize_label(on_disk_run_id)}")
     return 0
+
+
+def _assert_error(code: str, *, exit_code: int, location: str | None = None) -> int:
+    suffix = f" at {sanitize_label(location)}" if location else ""
+    print(f"tracord: assert failed: {code}{suffix}", file=sys.stderr)
+    return exit_code
 
 
 def handle_export(args: argparse.Namespace) -> int:
@@ -291,10 +340,16 @@ def print_export_preview(preview: dict[str, object]) -> None:
         for file in files
         if file["status"] != "scanned"
         or cast(dict[str, object], file["findings"])["total"] != 0
+        or file.get("identity_verified") is False
     ]
     for file in noteworthy[:MAX_TEXT_FILE_ENTRIES]:
         reason = f" reason={file['reason']}" if "reason" in file else ""
-        lines.append(f"{file['status']} {file['path']}{reason}")
+        identity = (
+            " identity=unverified"
+            if file.get("identity_verified") is False
+            else ""
+        )
+        lines.append(f"{file['status']} {file['path']}{reason}{identity}")
     if len(noteworthy) > MAX_TEXT_FILE_ENTRIES:
         lines.append(
             f"additional noteworthy files={len(noteworthy) - MAX_TEXT_FILE_ENTRIES}"

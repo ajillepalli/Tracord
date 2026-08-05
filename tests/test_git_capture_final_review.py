@@ -70,6 +70,33 @@ def test_literal_pathspec_environment_does_not_break_capture(tmp_path: Path, mon
     assert trace["file_changes"]["status"] == "captured"
 
 
+def test_ancestor_store_does_not_exclude_repository_content(
+    tmp_path: Path, monkeypatch
+):
+    repo = _init_repo(tmp_path)
+    repository_runs = repo / "runs"
+    repository_runs.mkdir()
+    tracked = repository_runs / "owned.txt"
+    tracked.write_text("before\n", encoding="utf-8")
+    _git(repo, "add", "runs/owned.txt")
+    _git(repo, "commit", "-m", "Track repository runs directory")
+    monkeypatch.chdir(repo)
+
+    trace = record_command(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('runs/owned.txt').write_text('after')",
+        ],
+        root=tmp_path,
+        capture_diff=True,
+    )
+
+    assert trace["file_changes"]["files"] == [
+        {"status": "M", "path": "runs/owned.txt"}
+    ]
+
+
 def _init_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()

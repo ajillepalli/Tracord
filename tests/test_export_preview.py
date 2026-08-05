@@ -170,7 +170,11 @@ def test_symlink_artifact_is_rejected(tmp_path: Path):
 def test_file_replacement_race_is_reported_with_fixed_reason(tmp_path: Path, monkeypatch):
     store = tmp_path / "store"
     _run_id, trace_directory = _record(store)
-    monkeypatch.setattr(preview_module, "_same_snapshot", lambda _first, _second: False)
+
+    def changed_after_read(_opened):
+        raise preview_module.SafePathError("changed")
+
+    monkeypatch.setattr(preview_module, "verify_opened_file", changed_after_read)
 
     result = preview_module._scan_file(
         source_dir=trace_directory,
@@ -184,6 +188,7 @@ def test_file_replacement_race_is_reported_with_fixed_reason(tmp_path: Path, mon
     assert result.payload["status"] == "unreadable"
     assert result.payload["reason"] == "changed_during_scan"
     assert result.payload["scanned_bytes"] == 0
+    assert result.payload["identity_verified"] is False
 
 
 def test_file_and_aggregate_limits_are_explicit(tmp_path: Path):
@@ -584,18 +589,12 @@ def test_bounded_reader_receives_the_exact_file_limit(tmp_path: Path, monkeypatc
     run_id, trace_directory = _record(store)
     scan_limit = (trace_directory / "trace.json").stat().st_size
     (trace_directory / "stdout.log").write_text("x" * (scan_limit * 2), encoding="utf-8")
-    original_fdopen = preview_module.os.fdopen
+    original_open = preview_module.open_prepared_file
     read_limits: list[int] = []
 
     class TrackingStream:
         def __init__(self, stream):
             self.stream = stream
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            self.stream.close()
 
         def read(self, size):
             read_limits.append(size)
@@ -604,10 +603,15 @@ def test_bounded_reader_receives_the_exact_file_limit(tmp_path: Path, monkeypatc
         def fileno(self):
             return self.stream.fileno()
 
-    def tracking_fdopen(*args, **kwargs):
-        return TrackingStream(original_fdopen(*args, **kwargs))
+        def close(self):
+            self.stream.close()
 
-    monkeypatch.setattr(preview_module.os, "fdopen", tracking_fdopen)
+    def tracking_open(prepared):
+        opened = original_open(prepared)
+        opened.stream = TrackingStream(opened.stream)
+        return opened
+
+    monkeypatch.setattr(preview_module, "open_prepared_file", tracking_open)
 
     preview_export(root=store, run_id=run_id, max_scan_bytes=scan_limit)
 
@@ -778,19 +782,111 @@ def test_unavailable_file_identity_is_not_certified(tmp_path: Path, monkeypatch)
 
     monkeypatch.setattr(Path, "lstat", zero_inode)
 
-    result = preview_module._scan_file(
-        source_dir=trace_directory,
-        relative_path="stdout.log",
-        file_id="artifact:stdout.log",
-        max_scan_bytes=preview_module.DEFAULT_MAX_SCAN_BYTES,
-        remaining_bytes=preview_module.MAX_PREVIEW_TOTAL_BYTES,
-    )
+    preview = preview_export(root=store, run_id=trace_directory.name)
+    result = next(file for file in preview["files"] if file["path"] == "stdout.log")
 
-    assert result.payload["status"] == "identity_unverified"
-    assert result.payload["reason"] == "identity_unavailable"
+    assert result["status"] == "scanned"
+    assert result["identity_verified"] is False
+    assert preview["export_would_succeed"] is True
+    assert "identity_unverified" in gate_reasons(preview)
+    assert "identity_unverified" in gate_reasons(
+        preview, allow_incomplete_scan=True
+    )
     run_id = trace_directory.name
     bundle = export_run(root=store, run_id=run_id, output_path=tmp_path / "run.zip")
     assert bundle.exists()
+
+
+def test_identity_unverified_scan_preserves_findings(tmp_path: Path, monkeypatch):
+    store = tmp_path / "store"
+    run_id, trace_directory = _record(store)
+    (trace_directory / "stdout.log").write_text(
+        "token=identity-sensitive-value", encoding="utf-8"
+    )
+    original_lstat = Path.lstat
+
+    class ZeroInode:
+        def __init__(self, info):
+            self._info = info
+            self.st_ino = 0
+
+        def __getattr__(self, name):
+            return getattr(self._info, name)
+
+    monkeypatch.setattr(Path, "lstat", lambda path: ZeroInode(original_lstat(path)))
+
+    preview = preview_export(root=store, run_id=run_id)
+    stdout = next(file for file in preview["files"] if file["path"] == "stdout.log")
+
+    assert stdout["status"] == "scanned"
+    assert stdout["identity_verified"] is False
+    assert stdout["findings"]["gating_total"] == 1
+    assert preview["findings"]["gating_total"] == 1
+
+
+def test_preview_keeps_hardlink_export_prediction_writer_faithful(tmp_path: Path):
+    store = tmp_path / "store"
+    run_id, trace_directory = _record(store)
+    try:
+        os.link(trace_directory / "stdout.log", tmp_path / "stdout-alias.log")
+    except OSError:
+        pytest.skip("hardlink creation is unavailable")
+
+    preview = preview_export(root=store, run_id=run_id)
+    stdout = next(file for file in preview["files"] if file["path"] == "stdout.log")
+
+    assert stdout["status"] == "scanned"
+    assert stdout["identity_verified"] is True
+    assert preview["export_would_succeed"] is True
+
+
+def test_never_opened_aggregate_limit_has_no_identity_claim(tmp_path: Path):
+    store = tmp_path / "store"
+    run_id, trace_directory = _record(store)
+    (trace_directory / "stdout.log").write_text("content", encoding="utf-8")
+    trace_size = (trace_directory / "trace.json").stat().st_size
+
+    preview = preview_export(
+        root=store,
+        run_id=run_id,
+        max_scan_bytes=trace_size,
+        max_total_scan_bytes=trace_size,
+    )
+    limited = next(file for file in preview["files"] if file["status"] == "aggregate_limit")
+
+    assert "identity_verified" not in limited
+    assert "identity_unverified" not in gate_reasons(preview)
+
+
+def test_preview_consumes_repeated_short_reads(tmp_path: Path, monkeypatch):
+    store = tmp_path / "store"
+    run_id, _trace_directory = _record(store)
+    original_open = preview_module.open_prepared_file
+
+    class ShortStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def read(self, size):
+            return self.stream.read(min(size, 3))
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def close(self):
+            self.stream.close()
+
+    def short_open(prepared):
+        opened = original_open(prepared)
+        opened.stream = ShortStream(opened.stream)
+        return opened
+
+    monkeypatch.setattr(preview_module, "open_prepared_file", short_open)
+
+    preview = preview_export(root=store, run_id=run_id)
+
+    assert preview["trace_valid"] is True
+    assert preview["scan"]["complete"] is True
 
 
 def test_nested_artifact_and_parent_failures_are_explicit(tmp_path: Path):

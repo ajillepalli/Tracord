@@ -12,12 +12,14 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from .redaction import redact_text
+from .storage import RUNS_DIR
 
 
 FILE_DIFF_ARTIFACT = "changes.patch"
 DEFAULT_MAX_DIFF_BYTES = 10 * 1024 * 1024
 DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
 _MAX_SUMMARY_BYTES = 4 * 1024 * 1024
+_MAX_PATHSPEC_BYTES = 16 * 1024 * 1024
 _GIT_CONTEXT_VARIABLES = {
     "GIT_CEILING_DIRECTORIES",
     "GIT_COMMON_DIR",
@@ -144,13 +146,18 @@ class GitDiffCapture:
                     "GIT_OPTIONAL_LOCKS": "0",
                 }
             )
-            self._exclude_path = _relative_store_path(self.repo_root, self.store)
-            if self._exclude_path == ".":
+            relative_store = _relative_store_path(self.repo_root, self.store)
+            if relative_store == ".":
                 self._initial_result = _result(
                     "error", reason="store_contains_repository"
                 )
                 self.close()
                 return
+            self._exclude_path = (
+                f"{relative_store}/{RUNS_DIR}"
+                if relative_store is not None
+                else None
+            )
             self.before_tree = self._snapshot("before")
         except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
             self._initial_result = _error_result(
@@ -264,15 +271,69 @@ class GitDiffCapture:
 
         pathspecs = ["."]
         if self._exclude_path is not None:
+            remove_store = _git(
+                self.repo_root,
+                [
+                    "rm",
+                    "-r",
+                    "-f",
+                    "--cached",
+                    "--ignore-unmatch",
+                    "--",
+                    f":(top,literal){self._exclude_path}",
+                ],
+                env=env,
+                timeout_seconds=self.git_timeout_seconds,
+            )
+            if remove_store.returncode != 0:
+                raise ValueError(
+                    _git_message(remove_store, self.redact)
+                    or "git runtime exclusion failed"
+                )
             pathspecs.append(f":(top,literal,exclude){self._exclude_path}")
-        add = _git(
+
+        changed_paths = _git_limited(
             self.repo_root,
-            ["add", "-A", "--", *pathspecs],
+            [
+                "ls-files",
+                "-z",
+                "--modified",
+                "--deleted",
+                "--others",
+                "--exclude-standard",
+                "--",
+                *pathspecs,
+            ],
             env=env,
             timeout_seconds=self.git_timeout_seconds,
+            max_bytes=_MAX_PATHSPEC_BYTES,
         )
-        if add.returncode != 0:
-            raise ValueError(_git_message(add, self.redact) or "git add failed")
+        if changed_paths.timed_out:
+            raise ValueError("git path discovery timed out")
+        if changed_paths.exceeded_limit:
+            raise ValueError("git path discovery exceeded its limit")
+        if changed_paths.returncode != 0:
+            raise ValueError(
+                _git_message(changed_paths, self.redact)
+                or "git path discovery failed"
+            )
+        if changed_paths.stdout:
+            pathspec_path = Path(self._temporary.name) / f"paths-{label}"
+            pathspec_path.write_bytes(changed_paths.stdout)
+            add = _git(
+                self.repo_root,
+                [
+                    "--literal-pathspecs",
+                    "add",
+                    "-A",
+                    f"--pathspec-from-file={pathspec_path.as_posix()}",
+                    "--pathspec-file-nul",
+                ],
+                env=env,
+                timeout_seconds=self.git_timeout_seconds,
+            )
+            if add.returncode != 0:
+                raise ValueError(_git_message(add, self.redact) or "git add failed")
 
         write_tree = _git(
             self.repo_root,

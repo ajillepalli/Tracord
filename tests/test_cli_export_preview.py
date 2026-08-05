@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tracord.cli import main, write_json_stdout
+from tracord.cli import main, print_export_preview, write_json_stdout
 from tracord.recorder import record_command
 from tracord.storage import run_dir
 
@@ -74,6 +74,42 @@ def test_human_preview_writes_utf8_when_stdout_is_redirected(tmp_path: Path, mon
 
     assert exit_code == 0
     assert "snowman-\u2603.log" in stdout.buffer.getvalue().decode("utf-8")
+
+
+def test_human_preview_names_identity_unverified_files(capsys):
+    print_export_preview(
+        {
+            "run_id_display": "run-1",
+            "export_would_succeed": True,
+            "export_preflight": "ready",
+            "scan": {
+                "complete": False,
+                "files_total": 1,
+                "files_scanned": 1,
+                "files_skipped": 0,
+                "bytes_scanned": 4,
+            },
+            "findings": {
+                "gating_total": 0,
+                "advisory_total": 0,
+                "already_redacted_total": 0,
+            },
+            "files": [
+                {
+                    "status": "scanned",
+                    "path": "stdout.log",
+                    "identity_verified": False,
+                    "findings": {"total": 0},
+                }
+            ],
+            "fail_reasons": ["identity_unverified"],
+            "gate_enforced": False,
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "scanned stdout.log identity=unverified" in output
+    assert "gate would fail: identity_unverified" in output
 
 
 def test_strict_gate_uses_exit_three_and_never_prints_secret(tmp_path: Path, capsys):
