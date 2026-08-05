@@ -180,6 +180,25 @@ traces; missing store identity metadata is treated as unverified.
 Decoder replacement does not prove byte integrity or a universal encoding.
 Recorder text normalizes CRLF and CR line endings to LF after decoding.
 
+### MCP proxy metadata
+
+Traces produced by `mcp-proxy` add an `mcp_proxy` object. It declares the
+`stdio` transport, selected tool-data policy, relayed-but-not-recorded stream
+policy, raw child exit code, whether cleanup was proxy initiated, shutdown
+reason, argv normalization counts, and observation/capture summaries.
+
+The observation summary contains `complete`, count-only unobserved, unmatched,
+and dropped totals, plus stable reason labels. `complete: false` means the tool
+lifecycle is partial; it does not mean the relayed protocol failed. Messages
+that are malformed, unsupported, or larger than the 1 MiB observation buffer
+remain on the wire unchanged. `capture_omitted` reports policy, budget, unsafe
+value, and final-size omissions without retaining the omitted values.
+
+MCP proxy command events declare `adapter: "mcp-stdio"`. Their stdout and
+stderr artifacts are empty by policy because stdout is a protocol channel and
+server stderr can contain sensitive data. The proxy does not infer tool
+timeouts or record cancellation reasons.
+
 ## Privacy
 
 Tracord defaults to redacting obvious secrets from command output before writing artifacts. Redaction is best effort and not a complete DLP system.

@@ -8,6 +8,7 @@ Tracord is a local-first CLI for recording, inspecting, exporting, importing, re
 src/tracord/
   cli.py          # argparse command surface
   recorder.py     # command execution and trace writing
+  mcp_proxy.py    # byte-transparent stdio relay and bounded MCP observation
   storage.py      # local run directory helpers
   schema.py       # lightweight trace validation
   assertion_files.py # strict repository assertion-file loading
@@ -51,6 +52,28 @@ perform capture or redaction. Runner and MCP adapters remain responsible for
 policy, redaction, and translating protocol-specific failures into stable,
 low-cardinality classifications. Tool outcomes do not determine the enclosing
 command status.
+
+## MCP Stdio Proxy
+
+`mcp-proxy` launches one server without a shell and places three independent
+binary relays between the MCP client and child process. Client stdin and server
+stdout are also observed as newline-delimited messages, but observation cannot
+change accepted protocol bytes. Server stderr is relayed and never recorded.
+The generated `stdout.log` and `stderr.log` are intentionally empty, with this
+policy declared in additive `mcp_proxy` metadata.
+
+The observer is handshake-neutral and recognizes only `tools/call`, matching
+responses, and cancellation notifications. JSON-RPC identifiers are typed and
+direction-scoped; trace-local call identifiers avoid storing protocol IDs.
+Malformed, unsupported, or messages larger than 1 MiB continue over the wire
+and make observation explicitly incomplete. In-flight calls, events, captures,
+stored argv, and the final trace all have independent bounds.
+
+The proxy and command recorder share identity-checked run creation, exclusive
+artifact writes, and atomic `trace.json` publication. POSIX children run in a
+new process group. Windows children are assigned to a verified kill-on-close
+Job Object. Client EOF and intercepted signals use bounded graceful shutdown
+and process-tree cleanup. See [mcp-stdio-proxy.md](mcp-stdio-proxy.md).
 
 ## Bundle Model
 
