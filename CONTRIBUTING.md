@@ -79,6 +79,7 @@ src/tracord/              # CLI and core recording code
   schema.py               # lightweight trace validation
   assertions.py           # deterministic assertion evaluation
   bundle.py               # portable .tracord.zip import/export
+  export_preview.py       # bounded, read-only export safety inspection
   replay.py               # command replay
   redaction.py            # named redaction rules and count-only summaries
   paths.py                # safe relative path handling

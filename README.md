@@ -28,6 +28,7 @@ The current MVP includes:
 - **Trace contract** - `tracord.trace.v0`, documented in [docs/trace-v0.md](docs/trace-v0.md) with a JSON Schema in [schemas/trace-v0.schema.json](schemas/trace-v0.schema.json).
 - **Deterministic assertions** - check status, exit code, timeout behavior, duration, and artifact contents.
 - **Portable bundles** - export and import `.tracord.zip` bundles with path traversal protections.
+- **Safe export preview** - inspect bundle contents with count-only secret findings and a strict CI gate before writing.
 - **Replay** - re-run the command from a recorded trace and store the replay as a new run.
 - **Local-first storage** - traces are stored under `.tracord/runs/` by default.
 
@@ -59,6 +60,8 @@ tracord record --capture-diff -- python agent.py
 tracord list
 tracord inspect <run-id>
 tracord assert <run-id> --status passed --stdout-contains tracord
+tracord export <run-id> --preview
+tracord export <run-id> --preview --json --fail-on-findings
 tracord export <run-id> --output hello.tracord.zip
 tracord import hello.tracord.zip
 tracord replay <run-id>
@@ -67,6 +70,11 @@ tracord replay <run-id>
 Recorded runs are stored locally under `.tracord/runs/`. Exported bundles are zip archives with a `.tracord.zip` suffix.
 
 File diff capture is opt-in because patches may contain sensitive source and data. See [docs/file-diff-capture.md](docs/file-diff-capture.md) for scope, redaction behavior, and limits.
+
+Export preview reads the raw trace and referenced artifacts without writing a
+bundle. Its strict gate returns exit code `3` for live secret findings, a
+blocked or unknown export preflight, or incomplete scan coverage. See
+[docs/bundle-v0.md](docs/bundle-v0.md) for limits and security semantics.
 
 ## Testing
 

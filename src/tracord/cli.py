@@ -6,13 +6,24 @@ import argparse
 import json
 import math
 import sys
+import zipfile
 from pathlib import Path
+from typing import cast
 
 from . import __version__
 from .assertions import TraceExpectations, evaluate_trace
 from .bundle import export_run, import_bundle
+from .export_preview import (
+    DEFAULT_MAX_SCAN_BYTES,
+    ExportPreviewError,
+    MAX_TEXT_FILE_ENTRIES,
+    PREVIEW_VERSION,
+    gate_reasons,
+    preview_export,
+)
 from .git_capture import DEFAULT_GIT_TIMEOUT_SECONDS, DEFAULT_MAX_DIFF_BYTES
 from .recorder import record_command
+from .redaction import sanitize_label
 from .replay import replay_run
 from .storage import DEFAULT_HOME, list_runs, read_json, run_dir
 
@@ -74,6 +85,25 @@ def build_parser() -> argparse.ArgumentParser:
     export_cmd.add_argument("--store", default=DEFAULT_HOME, help="trace store directory")
     export_cmd.add_argument("--output", type=Path, help="bundle path to write")
     export_cmd.add_argument("--overwrite", action="store_true", help="replace an existing bundle")
+    export_cmd.add_argument("--preview", action="store_true", help="inspect without writing a bundle")
+    export_cmd.add_argument(
+        "--json", dest="json_output", action="store_true", help="emit deterministic JSON"
+    )
+    export_cmd.add_argument(
+        "--fail-on-findings",
+        action="store_true",
+        help="exit 3 for gating findings, blocked export, or incomplete scan",
+    )
+    export_cmd.add_argument(
+        "--allow-incomplete-scan",
+        action="store_true",
+        help="allow incomplete coverage, but not findings or blocked exports",
+    )
+    export_cmd.add_argument(
+        "--max-scan-bytes",
+        type=positive_int,
+        help=f"maximum bytes scanned per file (default: {DEFAULT_MAX_SCAN_BYTES})",
+    )
     export_cmd.add_argument("run_id", help="run id to export")
     export_cmd.set_defaults(handler=handle_export)
 
@@ -175,6 +205,53 @@ def handle_assert(args: argparse.Namespace) -> int:
 
 
 def handle_export(args: argparse.Namespace) -> int:
+    preview_only_options = (
+        args.json_output,
+        args.fail_on_findings,
+        args.allow_incomplete_scan,
+        args.max_scan_bytes is not None,
+    )
+    if not args.preview and any(preview_only_options):
+        print("tracord: preview options require --preview", file=sys.stderr)
+        return 2
+    if args.preview and (args.output is not None or args.overwrite):
+        print("tracord: --preview cannot be used with --output or --overwrite", file=sys.stderr)
+        return 2
+    if args.preview:
+        try:
+            preview = preview_export(
+                root=Path(args.store),
+                run_id=args.run_id,
+                max_scan_bytes=args.max_scan_bytes or DEFAULT_MAX_SCAN_BYTES,
+            )
+        except ExportPreviewError as exc:
+            if args.json_output:
+                write_json_stdout(
+                    {
+                        "preview_version": PREVIEW_VERSION,
+                        "trace_valid": False
+                        if exc.code in {"invalid_trace", "invalid_trace_json"}
+                        else None,
+                        "error": exc.code,
+                    }
+                )
+            print(f"tracord: export preview failed: {exc.code}", file=sys.stderr)
+            return 2 if exc.code in {"invalid_run_id", "invalid_scan_limit"} else 1
+
+        reasons = gate_reasons(
+            preview,
+            allow_incomplete_scan=args.allow_incomplete_scan,
+        )
+        preview["fail_reasons"] = reasons
+        preview["gate_enforced"] = args.fail_on_findings
+        if args.json_output:
+            write_json_stdout(preview)
+        else:
+            print_export_preview(preview)
+        if args.fail_on_findings and reasons:
+            return 3
+        return 0
+
     try:
         bundle_path = export_run(
             root=Path(args.store),
@@ -182,20 +259,89 @@ def handle_export(args: argparse.Namespace) -> int:
             output_path=args.output,
             overwrite=args.overwrite,
         )
-    except (FileExistsError, FileNotFoundError, ValueError) as exc:
-        print(f"tracord: {exc}", file=sys.stderr)
+    except (FileExistsError, FileNotFoundError, OSError, ValueError) as exc:
+        print(f"tracord: {sanitize_label(str(exc))}", file=sys.stderr)
         return 1
-    print(f"exported {args.run_id} {bundle_path}")
+    print(
+        f"exported {sanitize_label(args.run_id)} {sanitize_label(str(bundle_path))}"
+    )
     return 0
+
+
+def print_export_preview(preview: dict[str, object]) -> None:
+    scan = cast(dict[str, object], preview["scan"])
+    findings = cast(dict[str, object], preview["findings"])
+    coverage = "complete" if scan["complete"] else "incomplete"
+    export_status = preview["export_preflight"]
+    lines = [
+        f"preview {preview['run_id_display']} export={export_status} scan={coverage}"
+    ]
+    lines.append(
+        f"files total={scan['files_total']} scanned={scan['files_scanned']} "
+        f"skipped={scan['files_skipped']} bytes={scan['bytes_scanned']}"
+    )
+    lines.append(
+        f"findings gating={findings['gating_total']} "
+        f"advisory={findings['advisory_total']} "
+        f"already-redacted={findings['already_redacted_total']}"
+    )
+    files = cast(list[dict[str, object]], preview["files"])
+    noteworthy = [
+        file
+        for file in files
+        if file["status"] != "scanned"
+        or cast(dict[str, object], file["findings"])["total"] != 0
+    ]
+    for file in noteworthy[:MAX_TEXT_FILE_ENTRIES]:
+        reason = f" reason={file['reason']}" if "reason" in file else ""
+        lines.append(f"{file['status']} {file['path']}{reason}")
+    if len(noteworthy) > MAX_TEXT_FILE_ENTRIES:
+        lines.append(
+            f"additional noteworthy files={len(noteworthy) - MAX_TEXT_FILE_ENTRIES}"
+        )
+    fail_reasons = preview["fail_reasons"]
+    if isinstance(fail_reasons, list) and fail_reasons:
+        gate_state = "failed" if preview["gate_enforced"] else "would fail"
+        lines.append(
+            f"gate {gate_state}: " + ", ".join(str(reason) for reason in fail_reasons)
+        )
+    _write_stdout("\n".join(lines) + "\n")
+
+
+def write_json_stdout(payload: dict[str, object]) -> None:
+    """Write deterministic JSON with LF even when the Windows console translates text."""
+    content = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    _write_stdout(content)
+
+
+def _write_stdout(content: str) -> None:
+    """Write UTF-8 bytes when stdout exposes its binary stream."""
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        sys.stdout.write(content)
+        sys.stdout.flush()
+        return
+    sys.stdout.flush()
+    buffer.write(content.encode("utf-8"))
+    buffer.flush()
 
 
 def handle_import(args: argparse.Namespace) -> int:
     try:
         trace = import_bundle(root=Path(args.store), bundle_path=args.bundle, overwrite=args.overwrite)
-    except (FileExistsError, FileNotFoundError, ValueError) as exc:
-        print(f"tracord: {exc}", file=sys.stderr)
+    except (
+        FileExistsError,
+        FileNotFoundError,
+        OSError,
+        ValueError,
+        RuntimeError,
+        RecursionError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as exc:
+        print(f"tracord: {sanitize_label(str(exc))}", file=sys.stderr)
         return 1
-    print(f"imported {trace['run_id']}")
+    print(f"imported {sanitize_label(str(trace['run_id']))}")
     return 0
 
 
