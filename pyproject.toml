@@ -29,8 +29,16 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Debuggers",
   "Topic :: System :: Logging"
+]
+
+[project.optional-dependencies]
+test = [
+  "jsonschema>=4.23,<5",
+  "pytest>=8.3,<9"
 ]
 
 [project.urls]
@@ -39,7 +47,7 @@ Repository = "https://github.com/ajillepalli/Tracord"
 Issues = "https://github.com/ajillepalli/Tracord/issues"
 
 [project.scripts]
-tracord = "tracord.cli:main"
+tracord = "tracord.cli:console_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tracord"]

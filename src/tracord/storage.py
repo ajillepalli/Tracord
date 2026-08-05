@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import stat
 from dataclasses import dataclass
 from os import stat_result
 from pathlib import Path
 from typing import Any
+
+from .paths import IdentityComparison, compare_identity, containment_issue, is_link_or_junction
 
 
 DEFAULT_HOME = ".tracord"
@@ -27,26 +30,135 @@ class PreparedStore:
 class StoreSafetyError(ValueError):
     """A path-free safe-store preparation or verification failure."""
 
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
 
 def ensure_store(root: Path) -> Path:
-    runs_dir = root / RUNS_DIR
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    return runs_dir
+    return prepare_store_for_write(root).runs
 
 
 def prepare_store_for_write(root: Path) -> PreparedStore:
     """Create if needed, then validate a store before publication."""
-    raise NotImplementedError
+    root = Path(root)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise StoreSafetyError("create_failed") from None
+
+    root_snapshot = _directory_snapshot(root)
+    runs = root / RUNS_DIR
+    try:
+        runs.mkdir(exist_ok=True)
+    except OSError:
+        raise StoreSafetyError("create_failed") from None
+
+    runs_snapshot = _directory_snapshot(runs)
+    root_final = _directory_snapshot(root)
+    root_identity = compare_identity(root_snapshot, root_final)
+    if root_identity is IdentityComparison.DIFFERENT:
+        raise StoreSafetyError("changed")
+    if containment_issue(root, runs) is not None:
+        raise StoreSafetyError("redirected")
+
+    return PreparedStore(
+        root=root,
+        runs=runs,
+        root_snapshot=root_final,
+        runs_snapshot=runs_snapshot,
+        identity_verified=(
+            root_identity is IdentityComparison.VERIFIED
+            and _identity_available(runs_snapshot)
+        ),
+    )
 
 
 def prepare_store_for_read(root: Path) -> PreparedStore | None:
     """Validate an existing store, returning none when it is absent."""
-    raise NotImplementedError
+    root = Path(root)
+    try:
+        root_snapshot = root.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise StoreSafetyError("stat_failed") from None
+    _validate_directory(root, root_snapshot)
+
+    root_final = _directory_snapshot(root)
+    if compare_identity(root_snapshot, root_final) is not IdentityComparison.VERIFIED:
+        raise StoreSafetyError("identity_unverifiable")
+
+    runs = root / RUNS_DIR
+    try:
+        runs_snapshot = runs.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise StoreSafetyError("stat_failed") from None
+    _validate_directory(runs, runs_snapshot)
+    if containment_issue(root, runs) is not None:
+        raise StoreSafetyError("redirected")
+
+    root_final = _directory_snapshot(root)
+    runs_final = _directory_snapshot(runs)
+    if (
+        compare_identity(root_snapshot, root_final)
+        is not IdentityComparison.VERIFIED
+        or compare_identity(runs_snapshot, runs_final)
+        is not IdentityComparison.VERIFIED
+    ):
+        raise StoreSafetyError("identity_unverifiable")
+
+    return PreparedStore(
+        root=root,
+        runs=runs,
+        root_snapshot=root_final,
+        runs_snapshot=runs_final,
+        identity_verified=True,
+    )
 
 
 def verify_prepared_store(store: PreparedStore) -> bool:
     """Return whether the prepared store still matches its snapshots."""
-    raise NotImplementedError
+    try:
+        root_snapshot = _directory_snapshot(store.root)
+        runs_snapshot = _directory_snapshot(store.runs)
+    except StoreSafetyError:
+        return False
+    if containment_issue(store.root, store.runs) is not None:
+        return False
+
+    root_identity = compare_identity(store.root_snapshot, root_snapshot)
+    runs_identity = compare_identity(store.runs_snapshot, runs_snapshot)
+    if IdentityComparison.DIFFERENT in {root_identity, runs_identity}:
+        return False
+    if store.identity_verified and (
+        root_identity is not IdentityComparison.VERIFIED
+        or runs_identity is not IdentityComparison.VERIFIED
+    ):
+        return False
+    return True
+
+
+def _directory_snapshot(path: Path) -> stat_result:
+    try:
+        snapshot = path.lstat()
+    except OSError:
+        raise StoreSafetyError("stat_failed") from None
+    _validate_directory(path, snapshot)
+    return snapshot
+
+
+def _validate_directory(path: Path, snapshot: stat_result) -> None:
+    if is_link_or_junction(path, snapshot):
+        raise StoreSafetyError("redirected")
+    if not stat.S_ISDIR(snapshot.st_mode):
+        raise StoreSafetyError("not_directory")
+
+
+def _identity_available(snapshot: stat_result) -> bool:
+    return snapshot.st_ino != 0
 
 
 def run_dir(root: Path, run_id: str) -> Path:
