@@ -66,7 +66,7 @@ def test_store_replacement_around_run_directory_publication_is_closed(
         calls += 1
         return calls != failure_call
 
-    monkeypatch.setattr(recorder, "verify_prepared_store", verify)
+    monkeypatch.setattr(recorder, "verify_prepared_run", verify)
     with pytest.raises(RecordError) as exc_info:
         record_command([sys.executable, "-c", "pass"], root=tmp_path / ".tracord")
     assert exc_info.value.code == "record_store_unwritable"
@@ -96,14 +96,14 @@ def test_identity_races_between_artifact_and_trace_publication_are_closed(
 def test_artifact_write_failures_are_fixed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact: str
 ) -> None:
-    original = Path.write_bytes
+    original = recorder.write_prepared_bytes
 
-    def fail(path: Path, data: bytes) -> int:
-        if path.name == artifact:
+    def fail(run: object, name: str, data: bytes) -> None:
+        if name == artifact:
             raise OSError("private path")
-        return original(path, data)
+        original(run, name, data)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(Path, "write_bytes", fail)
+    monkeypatch.setattr(recorder, "write_prepared_bytes", fail)
     with pytest.raises(RecordError) as exc_info:
         record_command([sys.executable, "-c", "pass"], root=tmp_path / ".tracord")
     assert exc_info.value.code == "record_store_unwritable"
@@ -116,7 +116,7 @@ def test_trace_write_failure_is_fixed(
     def fail(*_args: object, **_kwargs: object) -> None:
         raise OSError("private path")
 
-    monkeypatch.setattr(recorder, "write_json", fail)
+    monkeypatch.setattr(recorder, "publish_prepared_json", fail)
     with pytest.raises(RecordError) as exc_info:
         record_command([sys.executable, "-c", "pass"], root=tmp_path / ".tracord")
     assert exc_info.value.code == "record_store_unwritable"

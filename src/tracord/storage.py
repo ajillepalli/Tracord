@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
+import uuid
 from dataclasses import dataclass
 from os import stat_result
 from pathlib import Path
@@ -25,6 +27,16 @@ class PreparedStore:
     root_snapshot: stat_result
     runs_snapshot: stat_result
     identity_verified: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRun:
+    """A newly-created run directory tied to a verified store snapshot."""
+
+    store: PreparedStore
+    run_id: str
+    path: Path
+    snapshot: stat_result
 
 
 class StoreSafetyError(ValueError):
@@ -141,6 +153,88 @@ def verify_prepared_store(store: PreparedStore) -> bool:
     ):
         return False
     return True
+
+
+def prepare_run_for_write(root: Path, run_id: str) -> PreparedRun:
+    """Create one unique run directory and bind it to its store identity."""
+    store = prepare_store_for_write(root)
+    path = store.runs / run_id
+    try:
+        if not verify_prepared_store(store):
+            raise StoreSafetyError("changed")
+        path.mkdir(exist_ok=False)
+        snapshot = _directory_snapshot(path)
+        if not verify_prepared_store(store):
+            raise StoreSafetyError("changed")
+    except (OSError, StoreSafetyError):
+        raise StoreSafetyError("run_create_failed") from None
+    return PreparedRun(store=store, run_id=run_id, path=path, snapshot=snapshot)
+
+
+def verify_prepared_run(run: PreparedRun) -> bool:
+    """Return whether a prepared run and its parent store are unchanged."""
+    if not verify_prepared_store(run.store):
+        return False
+    if containment_issue(run.store.runs, run.path) is not None:
+        return False
+    try:
+        current = _directory_snapshot(run.path)
+    except StoreSafetyError:
+        return False
+    identity = compare_identity(run.snapshot, current)
+    if identity is IdentityComparison.DIFFERENT:
+        return False
+    if run.store.identity_verified and identity is not IdentityComparison.VERIFIED:
+        return False
+    return True
+
+
+def write_prepared_bytes(run: PreparedRun, name: str, data: bytes) -> None:
+    """Create one fixed-name run artifact without following an existing entry."""
+    if not verify_prepared_run(run):
+        raise StoreSafetyError("changed")
+    path = run.path / name
+    try:
+        with path.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError:
+        raise StoreSafetyError("write_failed") from None
+    if not verify_prepared_run(run):
+        raise StoreSafetyError("changed")
+
+
+def publish_prepared_json(run: PreparedRun, name: str, data: dict[str, Any]) -> None:
+    """Atomically publish one JSON file inside a prepared run directory."""
+    payload = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    temp_name = f".{name}.{uuid.uuid4().hex}.tmp"
+    temp_path = run.path / temp_name
+    target = run.path / name
+    try:
+        if not verify_prepared_run(run):
+            raise StoreSafetyError("changed")
+        with temp_path.open("x", encoding="utf-8", newline="\n") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if not verify_prepared_run(run):
+            raise StoreSafetyError("changed")
+        os.replace(temp_path, target)
+        if os.name != "nt":
+            directory_fd = os.open(run.path, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        if not verify_prepared_run(run):
+            raise StoreSafetyError("changed")
+    except (OSError, StoreSafetyError):
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise StoreSafetyError("write_failed") from None
 
 
 def _directory_snapshot(path: Path) -> stat_result:
