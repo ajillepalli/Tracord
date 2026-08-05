@@ -1,8 +1,13 @@
 import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
-from tracord.cli import build_parser, positive_float, positive_int
+from tracord.cli import build_parser, console_main, positive_float, positive_int
+from tracord.result_codes import JSON_OUTPUT_FAILURE_EXIT_CODE
 
 
 @pytest.mark.parametrize(
@@ -21,3 +26,52 @@ def test_record_parser_accepts_custom_git_timeout():
 
     assert args.capture_diff is True
     assert args.git_timeout == 120
+
+
+class BrokenFlush:
+    def flush(self) -> None:
+        raise BrokenPipeError
+
+    def fileno(self) -> int:
+        raise OSError
+
+
+def test_console_main_maps_broken_pipe_to_transport_exit(monkeypatch):
+    monkeypatch.setattr("tracord.cli.main", lambda _argv: 0)
+    monkeypatch.setattr(sys, "stdout", BrokenFlush())
+    monkeypatch.setattr(sys, "stderr", BrokenFlush())
+
+    assert console_main([]) == JSON_OUTPUT_FAILURE_EXIT_CODE
+
+
+@pytest.mark.parametrize("entrypoint", ["module", "console"])
+def test_process_entrypoints_suppress_broken_pipe_diagnostics(
+    entrypoint: str, tmp_path: Path
+):
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    command = (
+        [sys.executable, "-m", "tracord", "--version"]
+        if entrypoint == "module"
+        else [
+            str(
+                Path(sys.executable).with_name(
+                    "tracord.exe" if os.name == "nt" else "tracord"
+                )
+            ),
+            "--version",
+        ]
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=write_fd,
+            stderr=subprocess.PIPE,
+            cwd=tmp_path,
+            check=False,
+        )
+    finally:
+        os.close(write_fd)
+
+    assert completed.returncode == JSON_OUTPUT_FAILURE_EXIT_CODE
+    assert completed.stderr == b""

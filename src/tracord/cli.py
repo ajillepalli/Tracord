@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -32,6 +33,7 @@ from .git_capture import DEFAULT_GIT_TIMEOUT_SECONDS, DEFAULT_MAX_DIFF_BYTES
 from .recorder import record_command
 from .redaction import sanitize_label
 from .replay import replay_run
+from .result_codes import JSON_OUTPUT_FAILURE_EXIT_CODE
 from .storage import DEFAULT_HOME, list_runs, read_json, run_dir
 
 
@@ -39,6 +41,45 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.handler(args)
+
+
+def console_main(argv: list[str] | None = None) -> int:
+    """Run the CLI behind one process-level output transport boundary."""
+    try:
+        try:
+            exit_code = main(argv)
+        except SystemExit as exc:
+            exit_code = _system_exit_code(exc.code)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        return exit_code
+    except (BrokenPipeError, OSError):
+        _silence_broken_standard_streams()
+        return JSON_OUTPUT_FAILURE_EXIT_CODE
+
+
+def _system_exit_code(code: object) -> int:
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    return 1
+
+
+def _silence_broken_standard_streams() -> None:
+    """Prevent interpreter-shutdown retries after a process-level broken pipe."""
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                os.dup2(devnull_fd, stream.fileno())
+            except (AttributeError, OSError, ValueError):
+                continue
+    finally:
+        os.close(devnull_fd)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -449,4 +490,4 @@ def positive_float(value: str) -> float:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(console_main())
