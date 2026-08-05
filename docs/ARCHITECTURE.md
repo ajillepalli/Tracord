@@ -13,7 +13,7 @@ src/tracord/
   assertions.py   # deterministic assertion evaluation
   bundle.py       # portable .tracord.zip import/export
   replay.py       # command replay
-  redaction.py    # best-effort output redaction
+  redaction.py    # named redaction rules and count-only summaries
   paths.py        # safe relative path handling
   git_capture.py  # isolated Git before/after snapshots
 ```
@@ -43,6 +43,18 @@ See [bundle-v0.md](bundle-v0.md).
 Git diff capture uses temporary indexes and a temporary object directory to compare the working tree immediately before and after a command. It does not mutate the repository index, refs, working tree, or persistent object database.
 
 See [file-diff-capture.md](file-diff-capture.md).
+
+## Redaction Model
+
+Redaction rules have stable names, explicit replacement strategies, and gating
+metadata. `redact_text` applies them in a fixed order to preserve recorded output.
+The count-only summary API inspects each rule independently, so overlapping rules
+may count the same substring more than once. It never retains matched values,
+locations, lengths, or excerpts.
+
+Named assignments whose value is exactly `[REDACTED]` are tracked as already
+redacted and do not count as findings. The broad encoded-secret candidate is
+advisory because common Git object IDs and other repository content can match it.
 
 ## Design Constraints
 
