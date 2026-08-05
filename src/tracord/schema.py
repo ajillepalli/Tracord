@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import math
+import re
 from typing import Any
 
 from .result_codes import (
@@ -17,6 +18,10 @@ from .result_codes import (
 SCHEMA_VERSION = "tracord.trace.v0"
 STATUSES = {"passed", "failed", "timeout"}
 FILE_CHANGE_STATUSES = {"captured", "unchanged", "skipped", "omitted", "error"}
+TOOL_EVENT_TYPES = {"tool.call.started", "tool.call.finished"}
+TOOL_CAPTURE_STATES = {"captured", "redacted", "omitted"}
+TOOL_OUTCOMES = {"succeeded", "failed", "cancelled", "timeout"}
+TOOL_ERROR_TYPE_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 MAX_TRACE_NESTING_DEPTH = 256
 REQUIRED_FIELDS = (
     "schema_version",
@@ -115,16 +120,29 @@ def validate_trace(trace: Mapping[str, Any]) -> list[str]:
     if not isinstance(events, list):
         errors.append("events must be a list")
     else:
+        event_structure_valid = True
         for index, event in enumerate(events):
             if not isinstance(event, Mapping):
                 errors.append(f"events[{index}] must be an object")
+                event_structure_valid = False
                 continue
+            error_count = len(errors)
             if not isinstance(event.get("type"), str) or not event.get("type"):
                 errors.append(f"events[{index}].type must be a non-empty string")
             if not isinstance(event.get("at"), str) or not event.get("at"):
                 errors.append(f"events[{index}].at must be a non-empty string")
-            if not isinstance(event.get("data"), Mapping):
+            data = event.get("data")
+            if not isinstance(data, Mapping):
                 errors.append(f"events[{index}].data must be an object")
+            elif event.get("type") == "tool.call.started":
+                _validate_tool_call_started(index, data, errors)
+            elif event.get("type") == "tool.call.finished":
+                _validate_tool_call_finished(index, data, errors)
+            if len(errors) != error_count:
+                event_structure_valid = False
+
+        if event_structure_valid:
+            _validate_tool_call_lifecycle(events, errors)
 
     if "file_changes" in trace:
         _validate_file_changes(trace.get("file_changes"), artifacts, errors)
@@ -170,6 +188,178 @@ def _is_non_empty_string_sequence(value: object) -> bool:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return False
     return bool(value) and all(isinstance(item, str) for item in value)
+
+
+def _validate_tool_call_started(
+    index: int,
+    data: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    if not _is_non_empty_string(data.get("call_id")):
+        errors.append(f"events[{index}].data.call_id must be a non-empty string")
+        return
+    if not _is_non_empty_string(data.get("name")):
+        errors.append(f"events[{index}].data.name must be a non-empty string")
+        return
+    input_data = data.get("input")
+    if not isinstance(input_data, Mapping):
+        errors.append(f"events[{index}].data.input must be an object")
+        return
+    if not _validate_tool_capture(
+        index, "input", input_data, object_value=True, errors=errors
+    ):
+        return
+    if set(data) != {"call_id", "name", "input"}:
+        errors.append(
+            f"events[{index}].data must contain only approved tool.call.started fields"
+        )
+
+
+def _validate_tool_call_finished(
+    index: int,
+    data: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    if not _is_non_empty_string(data.get("call_id")):
+        errors.append(f"events[{index}].data.call_id must be a non-empty string")
+        return
+
+    outcome = data.get("outcome")
+    if not isinstance(outcome, str) or outcome not in TOOL_OUTCOMES:
+        errors.append(
+            f"events[{index}].data.outcome must be one of: cancelled, failed, succeeded, timeout"
+        )
+        return
+
+    duration_ms = data.get("duration_ms")
+    if (
+        not _is_json_schema_integer(duration_ms)
+        or not 0 <= duration_ms <= MAX_SAFE_JSON_INTEGER
+    ):
+        errors.append(
+            f"events[{index}].data.duration_ms must be a non-negative JSON-safe integer"
+        )
+        return
+
+    output = data.get("output")
+    if not isinstance(output, Mapping):
+        errors.append(f"events[{index}].data.output must be an object")
+        return
+    if not _validate_tool_capture(
+        index, "output", output, object_value=False, errors=errors
+    ):
+        return
+
+    error_type = data.get("error_type")
+    if outcome == "failed":
+        if (
+            not isinstance(error_type, str)
+            or TOOL_ERROR_TYPE_PATTERN.fullmatch(error_type) is None
+        ):
+            errors.append(
+                f"events[{index}].data.error_type must be an approved failure classification"
+            )
+            return
+        expected_fields = {"call_id", "outcome", "duration_ms", "output", "error_type"}
+    else:
+        if "error_type" in data:
+            errors.append(
+                f"events[{index}].data.error_type is allowed only for failed tool calls"
+            )
+            return
+        expected_fields = {"call_id", "outcome", "duration_ms", "output"}
+
+    if set(data) != expected_fields:
+        errors.append(
+            f"events[{index}].data must contain only approved tool.call.finished fields"
+        )
+
+
+def _validate_tool_capture(
+    index: int,
+    field: str,
+    value: Mapping[str, Any],
+    *,
+    object_value: bool,
+    errors: list[str],
+) -> bool:
+    capture = value.get("capture")
+    if not isinstance(capture, str) or capture not in TOOL_CAPTURE_STATES:
+        errors.append(
+            f"events[{index}].data.{field}.capture must be one of: captured, omitted, redacted"
+        )
+        return False
+
+    has_value = "value" in value
+    if capture == "omitted":
+        if has_value:
+            errors.append(
+                f"events[{index}].data.{field}.value is forbidden when capture is omitted"
+            )
+            return False
+        expected_fields = {"capture"}
+    else:
+        if not has_value:
+            errors.append(
+                f"events[{index}].data.{field}.value is required when capture is {capture}"
+            )
+            return False
+        if object_value and not isinstance(value["value"], Mapping):
+            errors.append(f"events[{index}].data.{field}.value must be an object")
+            return False
+        expected_fields = {"capture", "value"}
+
+    if set(value) != expected_fields:
+        errors.append(
+            f"events[{index}].data.{field} must contain only approved capture fields"
+        )
+        return False
+    return True
+
+
+def _validate_tool_call_lifecycle(
+    events: list[object],
+    errors: list[str],
+) -> None:
+    started: set[str] = set()
+    finished: set[str] = set()
+
+    for index, event in enumerate(events):
+        if not isinstance(event, Mapping) or event.get("type") not in TOOL_EVENT_TYPES:
+            continue
+        data = event["data"]
+        call_id = data["call_id"]
+        if event["type"] == "tool.call.started":
+            if call_id in started:
+                errors.append(
+                    f"events[{index}].data.call_id duplicates an earlier tool-call start"
+                )
+            else:
+                started.add(call_id)
+            continue
+
+        if call_id not in started:
+            errors.append(
+                f"events[{index}].data.call_id must reference an earlier tool-call start"
+            )
+        elif call_id in finished:
+            errors.append(
+                f"events[{index}].data.call_id duplicates an earlier tool-call finish"
+            )
+        else:
+            finished.add(call_id)
+
+
+def _is_non_empty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _is_json_schema_integer(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value) and value.is_integer()
 
 
 def _validate_file_changes(

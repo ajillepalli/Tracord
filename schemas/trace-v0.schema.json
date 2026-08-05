@@ -4,6 +4,141 @@
   "title": "Tracord Trace v0",
   "type": "object",
   "additionalProperties": true,
+  "$defs": {
+    "toolInputCapture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capture"],
+      "properties": {
+        "capture": {
+          "enum": ["captured", "redacted", "omitted"]
+        },
+        "value": {
+          "type": "object"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "capture": {
+                "enum": ["captured", "redacted"]
+              }
+            },
+            "required": ["capture"]
+          },
+          "then": {
+            "required": ["value"]
+          },
+          "else": {
+            "not": {
+              "required": ["value"]
+            }
+          }
+        }
+      ]
+    },
+    "toolOutputCapture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capture"],
+      "properties": {
+        "capture": {
+          "enum": ["captured", "redacted", "omitted"]
+        },
+        "value": true
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "capture": {
+                "enum": ["captured", "redacted"]
+              }
+            },
+            "required": ["capture"]
+          },
+          "then": {
+            "required": ["value"]
+          },
+          "else": {
+            "not": {
+              "required": ["value"]
+            }
+          }
+        }
+      ]
+    },
+    "toolCallStartedData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["call_id", "name", "input"],
+      "properties": {
+        "call_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input": {
+          "$ref": "#/$defs/toolInputCapture"
+        }
+      }
+    },
+    "toolCallFinishedData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["call_id", "outcome", "duration_ms", "output"],
+      "properties": {
+        "call_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "enum": ["succeeded", "failed", "cancelled", "timeout"]
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "output": {
+          "$ref": "#/$defs/toolOutputCapture"
+        },
+        "error_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z]",
+          "not": {
+            "pattern": "[^A-Za-z0-9_.-]"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": ["outcome"]
+          },
+          "then": {
+            "required": ["error_type"]
+          },
+          "else": {
+            "not": {
+              "required": ["error_type"]
+            }
+          }
+        }
+      ]
+    }
+  },
   "required": [
     "schema_version",
     "run_id",
@@ -186,7 +321,43 @@
           "data": {
             "type": "object"
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "tool.call.started"
+                }
+              },
+              "required": ["type"]
+            },
+            "then": {
+              "properties": {
+                "data": {
+                  "$ref": "#/$defs/toolCallStartedData"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "tool.call.finished"
+                }
+              },
+              "required": ["type"]
+            },
+            "then": {
+              "properties": {
+                "data": {
+                  "$ref": "#/$defs/toolCallFinishedData"
+                }
+              }
+            }
+          }
+        ]
       }
     }
   }

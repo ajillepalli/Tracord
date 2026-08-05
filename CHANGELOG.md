@@ -21,3 +21,4 @@ The format is based on Keep a Changelog, and this project will follow semantic v
 - Rejected redirected or unverifiable run stores across record, import, replay, inspect, assertions, and list; store failures remain fixed and path-free at the CLI.
 - Made legacy timeout content assertions indeterminate when decode replacement provenance is unknown.
 - Bounded text and JSON list output together at 1,000 runs with explicit incompleteness diagnostics.
+- Added protocol-neutral tool-call start/finish events with explicit capture states, lifecycle validation, privacy-safe diagnostics, and JSON Schema coverage.
