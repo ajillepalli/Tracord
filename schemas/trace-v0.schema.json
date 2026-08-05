@@ -76,11 +76,19 @@
       "properties": {
         "call_id": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 512,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          }
         },
         "name": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 512,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          }
         },
         "input": {
           "$ref": "#/$defs/toolInputCapture"
@@ -94,7 +102,11 @@
       "properties": {
         "call_id": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 512,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          }
         },
         "outcome": {
           "enum": ["succeeded", "failed", "cancelled", "timeout"]

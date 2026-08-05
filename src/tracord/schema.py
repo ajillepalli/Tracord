@@ -21,7 +21,9 @@ FILE_CHANGE_STATUSES = {"captured", "unchanged", "skipped", "omitted", "error"}
 TOOL_EVENT_TYPES = {"tool.call.started", "tool.call.finished"}
 TOOL_CAPTURE_STATES = {"captured", "redacted", "omitted"}
 TOOL_OUTCOMES = {"succeeded", "failed", "cancelled", "timeout"}
-TOOL_ERROR_TYPE_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
+TOOL_IDENTIFIER_MAX_LENGTH = 512
+TOOL_IDENTIFIER_CONTROL_PATTERN = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+TOOL_ERROR_TYPE_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")
 MAX_TRACE_NESTING_DEPTH = 256
 REQUIRED_FIELDS = (
     "schema_version",
@@ -195,11 +197,15 @@ def _validate_tool_call_started(
     data: Mapping[str, Any],
     errors: list[str],
 ) -> None:
-    if not _is_non_empty_string(data.get("call_id")):
-        errors.append(f"events[{index}].data.call_id must be a non-empty string")
+    if not _is_tool_identifier(data.get("call_id")):
+        errors.append(
+            f"events[{index}].data.call_id must be a 1-512 character control-free string"
+        )
         return
-    if not _is_non_empty_string(data.get("name")):
-        errors.append(f"events[{index}].data.name must be a non-empty string")
+    if not _is_tool_identifier(data.get("name")):
+        errors.append(
+            f"events[{index}].data.name must be a 1-512 character control-free string"
+        )
         return
     input_data = data.get("input")
     if not isinstance(input_data, Mapping):
@@ -220,8 +226,10 @@ def _validate_tool_call_finished(
     data: Mapping[str, Any],
     errors: list[str],
 ) -> None:
-    if not _is_non_empty_string(data.get("call_id")):
-        errors.append(f"events[{index}].data.call_id must be a non-empty string")
+    if not _is_tool_identifier(data.get("call_id")):
+        errors.append(
+            f"events[{index}].data.call_id must be a 1-512 character control-free string"
+        )
         return
 
     outcome = data.get("outcome")
@@ -327,8 +335,12 @@ def _validate_tool_call_lifecycle(
     for index, event in enumerate(events):
         if not isinstance(event, Mapping) or event.get("type") not in TOOL_EVENT_TYPES:
             continue
-        data = event["data"]
-        call_id = data["call_id"]
+        data = event.get("data")
+        if not isinstance(data, Mapping):
+            continue
+        call_id = data.get("call_id")
+        if not _is_tool_identifier(call_id):
+            continue
         if event["type"] == "tool.call.started":
             if call_id in started:
                 errors.append(
@@ -352,6 +364,14 @@ def _validate_tool_call_lifecycle(
 
 def _is_non_empty_string(value: object) -> bool:
     return isinstance(value, str) and bool(value)
+
+
+def _is_tool_identifier(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= TOOL_IDENTIFIER_MAX_LENGTH
+        and TOOL_IDENTIFIER_CONTROL_PATTERN.search(value) is None
+    )
 
 
 def _is_json_schema_integer(value: object) -> bool:

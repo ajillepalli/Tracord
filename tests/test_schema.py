@@ -98,7 +98,12 @@ def trace_for_event(event: dict[str, object]) -> dict[str, object]:
     if event["type"] == "tool.call.finished":
         data = event.get("data")
         call_id = data.get("call_id") if isinstance(data, dict) else None
-        events.insert(0, tool_started(call_id if isinstance(call_id, str) else "call-1"))
+        valid_call_id = (
+            isinstance(call_id, str)
+            and 1 <= len(call_id) <= 512
+            and not any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in call_id)
+        )
+        events.insert(0, tool_started(call_id if valid_call_id else "call-1"))
     return valid_trace(events=events)
 
 
@@ -225,19 +230,29 @@ def invalid_tool_events():
     cases.append((event, "only approved tool.call.started fields"))
     event = tool_started()
     event["data"]["call_id"] = ""
-    cases.append((event, ".call_id must be a non-empty string"))
+    cases.append((event, ".call_id must be a 1-512 character control-free string"))
+    event = tool_started("A" * 513)
+    cases.append((event, ".call_id must be a 1-512 character control-free string"))
+    event = tool_started("unsafe\nidentifier")
+    cases.append((event, ".call_id must be a 1-512 character control-free string"))
     event = tool_started()
     event["data"]["name"] = ""
-    cases.append((event, ".name must be a non-empty string"))
+    cases.append((event, ".name must be a 1-512 character control-free string"))
+    event = tool_started()
+    event["data"]["name"] = "A" * 513
+    cases.append((event, ".name must be a 1-512 character control-free string"))
+    event = tool_started()
+    event["data"]["name"] = "unsafe\tname"
+    cases.append((event, ".name must be a 1-512 character control-free string"))
 
     event = tool_finished(outcome="unknown")
     cases.append((event, ".outcome must be one of"))
     event = tool_finished()
     del event["data"]["call_id"]
-    cases.append((event, ".call_id must be a non-empty string"))
+    cases.append((event, ".call_id must be a 1-512 character control-free string"))
     event = tool_finished()
     event["data"]["call_id"] = []
-    cases.append((event, ".call_id must be a non-empty string"))
+    cases.append((event, ".call_id must be a 1-512 character control-free string"))
     event = tool_finished()
     event["data"]["outcome"] = []
     cases.append((event, ".outcome must be one of"))
@@ -299,6 +314,10 @@ def test_validate_trace_rejects_invalid_tool_event_structure(event, expected):
             [tool_started(), tool_finished(), tool_finished()],
             "duplicates an earlier tool-call finish",
         ),
+        (
+            [tool_started(), tool_finished(), tool_started()],
+            "duplicates an earlier tool-call start",
+        ),
     ],
 )
 def test_validate_trace_rejects_invalid_tool_lifecycle(events, expected):
@@ -313,6 +332,34 @@ def test_validate_trace_tool_errors_do_not_echo_untrusted_values():
 
     assert any("duplicates an earlier tool-call start" in error for error in errors)
     assert all(secret not in error for error in errors)
+
+
+def test_validate_trace_structural_errors_do_not_echo_untrusted_values():
+    secret = "super-secret-tool-value"
+    invalid_name = tool_started()
+    invalid_name["data"]["name"] = secret + "\n"
+    invalid_input = tool_started()
+    invalid_input["data"]["input"]["value"] = [secret]
+    invalid_error = tool_finished(outcome="failed")
+    invalid_error["data"]["error_type"] = secret + "!"
+
+    for event in (invalid_name, invalid_input, invalid_error):
+        errors = validate_trace(trace_for_event(event))
+        assert errors
+        assert all(secret not in error for error in errors)
+
+
+def test_validate_trace_defers_lifecycle_until_all_event_structure_is_valid():
+    events = [
+        {"type": "custom", "at": "", "data": {}},
+        tool_started(),
+        tool_started(),
+    ]
+
+    errors = validate_trace(valid_trace(events=events))
+
+    assert "events[0].at must be a non-empty string" in errors
+    assert not any("duplicates an earlier tool-call start" in error for error in errors)
 
 
 @pytest.mark.parametrize("duration", [0, 1.0, MAX_SAFE_JSON_INTEGER])
@@ -355,21 +402,33 @@ def structural_parity_events():
     valid_failed = tool_finished(outcome="failed")
     valid_max_error_type = tool_finished(outcome="failed")
     valid_max_error_type["data"]["error_type"] = "A" + ("x" * 63)
+    valid_max_identifiers = tool_started("A" * 512)
+    valid_max_identifiers["data"]["name"] = "N" * 512
 
     invalid_started = tool_started(include_value=False)
+    invalid_missing_started_data = tool_started()
+    del invalid_missing_started_data["data"]
     invalid_input = tool_started(value=[])
     invalid_missing_input = tool_started()
     del invalid_missing_input["data"]["input"]
     invalid_nonobject_input = tool_started()
     invalid_nonobject_input["data"]["input"] = []
     invalid_empty_started_call_id = tool_started("")
+    invalid_long_started_call_id = tool_started("A" * 513)
+    invalid_control_started_call_id = tool_started("unsafe\nidentifier")
     invalid_empty_tool_name = tool_started()
     invalid_empty_tool_name["data"]["name"] = ""
+    invalid_long_tool_name = tool_started()
+    invalid_long_tool_name["data"]["name"] = "N" * 513
+    invalid_control_tool_name = tool_started()
+    invalid_control_tool_name["data"]["name"] = "unsafe\tname"
     invalid_capture = tool_started(capture="invalid")
     invalid_omitted_value = tool_started(capture="omitted", include_value=True)
     invalid_capture_extra = tool_started()
     invalid_capture_extra["data"]["input"]["extra"] = True
     invalid_finished = tool_finished(include_value=False)
+    invalid_missing_finished_data = tool_finished()
+    del invalid_missing_finished_data["data"]
     invalid_missing_output = tool_finished()
     del invalid_missing_output["data"]["output"]
     invalid_nonobject_output = tool_finished()
@@ -403,16 +462,23 @@ def structural_parity_events():
         (valid_integral_float, True),
         (valid_failed, True),
         (valid_max_error_type, True),
+        (valid_max_identifiers, True),
         (invalid_started, False),
+        (invalid_missing_started_data, False),
         (invalid_input, False),
         (invalid_missing_input, False),
         (invalid_nonobject_input, False),
         (invalid_empty_started_call_id, False),
+        (invalid_long_started_call_id, False),
+        (invalid_control_started_call_id, False),
         (invalid_empty_tool_name, False),
+        (invalid_long_tool_name, False),
+        (invalid_control_tool_name, False),
         (invalid_capture, False),
         (invalid_omitted_value, False),
         (invalid_capture_extra, False),
         (invalid_finished, False),
+        (invalid_missing_finished_data, False),
         (invalid_missing_output, False),
         (invalid_nonobject_output, False),
         (invalid_empty_finished_call_id, False),
@@ -493,3 +559,15 @@ def test_existing_command_and_file_diff_events_retain_open_data():
 
     assert validate_trace(trace) == []
     assert schema_errors(trace) == []
+
+
+def test_json_schema_structure_does_not_claim_python_trace_safety_bounds():
+    deeply_nested: object = None
+    for _ in range(256):
+        deeply_nested = {"nested": deeply_nested}
+
+    for value in (MAX_SAFE_JSON_INTEGER + 1, deeply_nested):
+        trace = valid_trace(events=[tool_started(), tool_finished(value=value)])
+
+        assert schema_errors(trace) == []
+        assert validate_trace(trace)

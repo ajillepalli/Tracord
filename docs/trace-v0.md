@@ -58,9 +58,10 @@ input capture declaration:
 }
 ```
 
-`data` has exactly `call_id`, `name`, and `input`. Both strings must be
-non-empty and are not trimmed or normalized. `input` has one of these exact
-shapes:
+`data` has exactly `call_id`, `name`, and `input`. Both identifiers are 1-512
+characters, exclude C0/C1 control characters, and are not trimmed or
+normalized. Spaces and protocol-specific printable characters remain valid.
+`input` has one of these exact shapes:
 
 - `{"capture": "captured", "value": {...}}` stores the input object as supplied.
 - `{"capture": "redacted", "value": {...}}` declares that the producer changed at least one sensitive value.
@@ -133,12 +134,15 @@ Tool-call lifecycle is evaluated in event-array order, not timestamp order:
 
 Known tool-call `data`, `input`, and `output` objects reject unknown fields. The
 outer event envelope stays open. The Python validator checks all event structure
-before lifecycle and emits index-based errors that do not echo tool names,
-identifiers, arguments, results, or error classifications. Consumers of raw
-third-party JSON Schema diagnostics must sanitize them separately.
+before lifecycle; lifecycle diagnostics are withheld until every event envelope
+and known shape passes so structural errors have deterministic precedence. The
+validator emits index-based errors that do not echo tool names, identifiers,
+arguments, results, or error classifications. Consumers of raw third-party JSON
+Schema diagnostics must sanitize them separately.
 
-Captured values retain the trace-wide numeric and nesting limits described
-below.
+The Python validator applies the trace-wide numeric and nesting limits described
+below to captured values. JSON Schema enforces event structure only and cannot
+by itself enforce Tracord's recursive container or JSON-safe-number bounds.
 
 Safe trace readers reject JSON with more than 256 simultaneously open
 containers, including the root. This canonical bound applies to list, inspect,
