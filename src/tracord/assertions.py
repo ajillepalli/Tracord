@@ -3,75 +3,45 @@
 from __future__ import annotations
 
 import codecs
-import json
-import math
-import os
-import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .bundle import TRACE_FILE, validate_run_id
 from .paths import (
     IdentityComparison,
     SafePathError,
-    combine_identity,
-    compare_snapshot,
-    containment_issue,
-    is_link_or_junction,
     open_prepared_file,
     prepare_regular_file,
     verify_opened_file,
 )
-from .schema import STATUSES, validate_trace
-from .storage import RUNS_DIR
+from .result_codes import (
+    ASSERTION_EXPECTATION_LOCATIONS,
+    ASSERTION_FAILURE_CODES,
+    ASSERTION_RUN_ERROR_CODES,
+    ASSERTION_VALIDATION_ERROR_CODES,
+    DECODE_REPLACEMENT_STATES,
+)
+from .schema import STATUSES
+from .trace_access import (
+    MAX_TRACE_BYTES,
+    TraceAccessError,
+    load_trace,
+    verify_run_directory,
+)
 
 
-MAX_TRACE_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_ARTIFACT_BYTES = 16 * 1024 * 1024
 READ_CHUNK_BYTES = 1024 * 1024
 MAX_NEEDLE_BYTES = 65_536
 TAIL_BYTES = MAX_NEEDLE_BYTES - 1
-MAX_JSON_INTEGER_DIGITS = 128
-_EXPECTATION_LOCATIONS = frozenset(
-    {
-        "status",
-        "exit_code",
-        "stdout_contains",
-        "stderr_contains",
-        "max_duration_ms",
-        "no_timeout",
-    }
-)
-_RUN_ERROR_CODES = frozenset(
-    {
-        "invalid_run_id",
-        "run_not_found",
-        "trace_unreadable",
-        "trace_invalid",
-        "run_identity_mismatch",
-    }
-)
-_FAILURE_CODES = frozenset(
-    {
-        "artifact_unreadable",
-        "artifact_invalid_utf8",
-        "artifact_changed",
-        "assertion_mismatch",
-        "scan_incomplete",
-    }
-)
-_VALIDATION_CODES = frozenset(
-    {"assertion_value_invalid", "assertion_no_expectations"}
-)
 
 
 class ExpectationValidationError(ValueError):
     """A fixed-code expectation construction error."""
 
     def __init__(self, code: str) -> None:
-        if code not in _VALIDATION_CODES:
+        if code not in ASSERTION_VALIDATION_ERROR_CODES:
             raise ValueError("unknown expectation validation code")
         self.code = code
         super().__init__(code)
@@ -81,9 +51,9 @@ class AssertionRunError(ValueError):
     """A fixed-code run evaluation error."""
 
     def __init__(self, code: str, location: str | None = None) -> None:
-        if code not in _RUN_ERROR_CODES:
+        if code not in ASSERTION_RUN_ERROR_CODES:
             raise ValueError("unknown assertion run error code")
-        if location is not None and location not in _EXPECTATION_LOCATIONS:
+        if location is not None and location not in ASSERTION_EXPECTATION_LOCATIONS:
             raise ValueError("unsafe assertion run error location")
         self.code = code
         self.location = location
@@ -96,9 +66,9 @@ class AssertionFailure:
     location: str
 
     def __post_init__(self) -> None:
-        if self.code not in _FAILURE_CODES:
+        if self.code not in ASSERTION_FAILURE_CODES:
             raise ValueError("unknown assertion failure code")
-        if self.location not in _EXPECTATION_LOCATIONS:
+        if self.location not in ASSERTION_EXPECTATION_LOCATIONS:
             raise ValueError("unsafe assertion failure location")
 
 
@@ -164,44 +134,6 @@ def validate_expectations(expectations: TraceExpectations) -> _ValidatedExpectat
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _RunDirectory:
-    root_path: Path
-    root_initial: os.stat_result
-    runs_path: Path
-    runs_initial: os.stat_result
-    path: Path
-    initial: os.stat_result
-
-
-def _reject_json_constant(_: str) -> float:
-    raise ValueError("nonfinite JSON number")
-
-
-def _finite_json_float(value: str) -> float:
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        raise ValueError("nonfinite JSON number")
-    return parsed
-
-
-def _bounded_json_integer(value: str) -> int:
-    if len(value.removeprefix("-")) > MAX_JSON_INTEGER_DIGITS:
-        raise ValueError("oversized JSON integer")
-    return int(value)
-
-
-def _json_object_without_duplicates(
-    pairs: list[tuple[str, object]],
-) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON key")
-        result[key] = value
-    return result
-
-
 def evaluate_run(
     root: Path,
     run_id: str,
@@ -209,39 +141,13 @@ def evaluate_run(
 ) -> tuple[str, list[AssertionFailure]]:
     """Evaluate one run and return only stable, content-free failure codes."""
     validated = validate_expectations(expectations)
-    if not isinstance(run_id, str):
-        raise AssertionRunError("invalid_run_id")
     try:
-        validate_run_id(run_id)
-    except ValueError:
-        raise AssertionRunError("invalid_run_id") from None
-
-    run, run_failure = _resolve_run_directory(root, run_id)
-    if run_failure is not None or run is None:
-        raise AssertionRunError(run_failure or "run_not_found")
-
-    trace_bytes, trace_failure = _read_trace(run.path)
-    if trace_failure is not None or trace_bytes is None:
-        raise AssertionRunError(trace_failure or "trace_unreadable")
-
-    try:
-        trace_text = trace_bytes.decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        raise AssertionRunError("trace_invalid") from None
-    try:
-        trace = json.loads(
-            trace_text,
-            object_pairs_hook=_json_object_without_duplicates,
-            parse_constant=_reject_json_constant,
-            parse_float=_finite_json_float,
-            parse_int=_bounded_json_integer,
-        )
-    except (RecursionError, UnicodeDecodeError, ValueError):
-        raise AssertionRunError("trace_invalid") from None
-    if not isinstance(trace, dict) or validate_trace(trace):
-        raise AssertionRunError("trace_invalid")
-    if trace.get("run_id") != run_id:
-        raise AssertionRunError("run_identity_mismatch")
+        loaded = load_trace(root, run_id, max_bytes=MAX_TRACE_BYTES)
+    except TraceAccessError as exc:
+        code = "trace_unreadable" if exc.code == "trace_too_large" else exc.code
+        raise AssertionRunError(code) from None
+    run = loaded.run
+    trace = loaded.trace
 
     failures: list[AssertionFailure] = []
     if validated.status is not None and trace.get("status") != validated.status:
@@ -253,6 +159,8 @@ def evaluate_run(
         failures.append(AssertionFailure("assertion_mismatch", "exit_code"))
 
     artifacts = trace.get("artifacts")
+    replacement = trace.get("decode_replacement")
+    timed_out = trace.get("timed_out") is True
     remaining_bytes = MAX_TOTAL_ARTIFACT_BYTES
     stdout_failure, stdout_read = _contains_failure(
         artifacts.get("stdout") if isinstance(artifacts, Mapping) else None,
@@ -260,6 +168,9 @@ def evaluate_run(
         label="stdout",
         expected=validated.stdout_needle,
         remaining_bytes=remaining_bytes,
+        decode_replacement=_decode_replacement_state(
+            replacement, "stdout", timed_out=timed_out
+        ),
     )
     remaining_bytes -= stdout_read
     if stdout_failure is not None:
@@ -271,6 +182,9 @@ def evaluate_run(
         label="stderr",
         expected=validated.stderr_needle,
         remaining_bytes=remaining_bytes,
+        decode_replacement=_decode_replacement_state(
+            replacement, "stderr", timed_out=timed_out
+        ),
     )
     if stderr_failure is not None:
         failures.append(stderr_failure)
@@ -285,9 +199,10 @@ def evaluate_run(
     if validated.no_timeout and trace.get("timed_out") is not False:
         failures.append(AssertionFailure("assertion_mismatch", "no_timeout"))
 
-    run_failure = _verify_run_directory(run)
-    if run_failure is not None:
-        raise AssertionRunError(run_failure)
+    try:
+        verify_run_directory(run)
+    except TraceAccessError as exc:
+        raise AssertionRunError(exc.code) from None
     return run.path.name, failures
 
 
@@ -305,132 +220,6 @@ def _encode_needle(value: str | None) -> bytes | None:
     return encoded
 
 
-def _resolve_run_directory(
-    root: Path, run_id: str
-) -> tuple[_RunDirectory | None, str | None]:
-    runs_path = root / RUNS_DIR
-    try:
-        root_initial = root.lstat()
-        runs_initial = runs_path.lstat()
-    except FileNotFoundError:
-        return None, "run_not_found"
-    except OSError:
-        return None, "run_not_found"
-    if (
-        is_link_or_junction(root, root_initial)
-        or not stat.S_ISDIR(root_initial.st_mode)
-        or is_link_or_junction(runs_path, runs_initial)
-        or not stat.S_ISDIR(runs_initial.st_mode)
-        or containment_issue(root, runs_path) is not None
-    ):
-        return None, "run_identity_mismatch"
-
-    try:
-        with os.scandir(runs_path) as entries:
-            names = [entry.name for entry in entries]
-    except OSError:
-        return None, "run_not_found"
-    exact_name = next((name for name in names if name == run_id), None)
-    aliases = [name for name in names if name.casefold() == run_id.casefold()]
-    if exact_name is not None and aliases != [exact_name]:
-        return None, "run_identity_mismatch"
-    if exact_name is None:
-        if aliases:
-            return None, "run_identity_mismatch"
-        return None, "run_not_found"
-
-    path = runs_path / exact_name
-    if containment_issue(runs_path, path) is not None:
-        return None, "run_identity_mismatch"
-    try:
-        initial = path.lstat()
-    except FileNotFoundError:
-        return None, "run_not_found"
-    except OSError:
-        return None, "run_not_found"
-    if is_link_or_junction(path, initial) or not stat.S_ISDIR(initial.st_mode):
-        return None, "run_identity_mismatch"
-
-    try:
-        root_checked = root.lstat()
-        runs_checked = runs_path.lstat()
-        checked = path.lstat()
-    except OSError:
-        return None, "run_identity_mismatch"
-    identity = combine_identity(
-        compare_snapshot(root_initial, root_checked),
-        compare_snapshot(runs_initial, runs_checked),
-        compare_snapshot(initial, checked),
-    )
-    if identity is IdentityComparison.DIFFERENT:
-        return None, "run_identity_mismatch"
-    if identity is IdentityComparison.UNAVAILABLE:
-        return None, "run_identity_mismatch"
-    return _RunDirectory(
-        root,
-        root_initial,
-        runs_path,
-        runs_initial,
-        path,
-        initial,
-    ), None
-
-
-def _verify_run_directory(run: _RunDirectory) -> str | None:
-    try:
-        root_final = run.root_path.lstat()
-        runs_final = run.runs_path.lstat()
-        final = run.path.lstat()
-    except OSError:
-        return "run_identity_mismatch"
-    if (
-        is_link_or_junction(run.root_path, root_final)
-        or not stat.S_ISDIR(root_final.st_mode)
-        or is_link_or_junction(run.runs_path, runs_final)
-        or not stat.S_ISDIR(runs_final.st_mode)
-        or is_link_or_junction(run.path, final)
-        or not stat.S_ISDIR(final.st_mode)
-        or containment_issue(run.root_path, run.runs_path) is not None
-        or containment_issue(run.runs_path, run.path) is not None
-    ):
-        return "run_identity_mismatch"
-    identity = combine_identity(
-        compare_snapshot(run.root_initial, root_final),
-        compare_snapshot(run.runs_initial, runs_final),
-        compare_snapshot(run.initial, final),
-    )
-    if identity is IdentityComparison.DIFFERENT:
-        return "run_identity_mismatch"
-    if identity is IdentityComparison.UNAVAILABLE:
-        return "run_identity_mismatch"
-    return None
-
-
-def _read_trace(trace_dir: Path) -> tuple[bytes | None, str | None]:
-    try:
-        prepared = prepare_regular_file(
-            trace_dir, TRACE_FILE, require_single_link=True
-        )
-    except SafePathError as exc:
-        return None, "trace_unreadable"
-    if prepared.initial.st_size > MAX_TRACE_BYTES:
-        return None, "trace_unreadable"
-
-    try:
-        with open_prepared_file(prepared) as opened:
-            data, short_read = _read_exact(opened.stream, prepared.initial.st_size)
-            identity = verify_opened_file(opened)
-    except SafePathError as exc:
-        return None, "trace_unreadable"
-    except OSError:
-        return None, "trace_unreadable"
-    if short_read:
-        return None, "trace_unreadable"
-    if identity is IdentityComparison.UNAVAILABLE:
-        return None, "trace_unreadable"
-    return data, None
-
-
 def _contains_failure(
     artifact_name: object,
     *,
@@ -438,10 +227,15 @@ def _contains_failure(
     label: str,
     expected: bytes | None,
     remaining_bytes: int,
+    decode_replacement: str,
 ) -> tuple[AssertionFailure | None, int]:
     location = f"{label}_contains"
     if expected is None:
         return None, 0
+    if decode_replacement == "present":
+        return AssertionFailure("artifact_decode_replaced", location), 0
+    if decode_replacement == "unknown":
+        return AssertionFailure("artifact_decode_unknown", location), 0
     if not isinstance(artifact_name, str) or not artifact_name:
         return AssertionFailure("artifact_unreadable", location), 0
     if remaining_bytes <= 0:
@@ -517,16 +311,14 @@ def _contains_failure(
     return AssertionFailure("assertion_mismatch", location), bytes_read
 
 
-def _read_exact(stream: object, size: int) -> tuple[bytes, bool]:
-    chunks: list[bytes] = []
-    bytes_read = 0
-    while bytes_read < size:
-        requested = min(READ_CHUNK_BYTES, size - bytes_read)
-        chunk = stream.read(requested)
-        if not chunk:
-            return b"".join(chunks), True
-        if len(chunk) > requested:
-            return b"".join((*chunks, chunk[:requested])), True
-        chunks.append(chunk)
-        bytes_read += len(chunk)
-    return b"".join(chunks), False
+def _decode_replacement_state(
+    value: object, label: str, *, timed_out: bool
+) -> str:
+    if value is None:
+        return "unknown" if timed_out else "none"
+    if not isinstance(value, Mapping):
+        raise AssertionRunError("trace_invalid")
+    state = value.get(label)
+    if state not in DECODE_REPLACEMENT_STATES:
+        raise AssertionRunError("trace_invalid")
+    return state

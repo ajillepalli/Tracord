@@ -3,10 +3,10 @@
 </p>
 
 <p align="center">
-  <a href="docs/ARCHITECTURE.md"><strong>Architecture</strong></a> &middot;
-  <a href="docs/ROADMAP.md"><strong>Roadmap</strong></a> &middot;
-  <a href="CONTRIBUTING.md"><strong>Contributing</strong></a> &middot;
-  <a href="SECURITY.md"><strong>Security</strong></a>
+  <a href="#install-and-record-your-first-run"><strong>Quick start</strong></a> &middot;
+  <a href="#common-workflows"><strong>Workflows</strong></a> &middot;
+  <a href="#documentation"><strong>Documentation</strong></a> &middot;
+  <a href="CONTRIBUTING.md"><strong>Contributing</strong></a>
 </p>
 
 <p align="center">
@@ -15,141 +15,110 @@
   <img alt="Local first" src="https://img.shields.io/badge/local--first-agent%20traces-111827.svg" />
 </p>
 
-Tracord is a local-first flight recorder for agentic software. It records command and agent-run evidence, writes portable traces, supports deterministic assertions, and turns known failures into replayable regression checks.
+Tracord is a local-first flight recorder for agentic software. Wrap a command to capture its status, timing, output, and optional Git changes, then inspect, assert, export, or replay that evidence without sending it to a hosted service.
 
-The project is aimed at developers building coding agents, MCP tools, and other tool-using AI systems who need to answer: what did the agent do, what changed, what failed, what did it cost, and can we replay or test that behavior later?
+## Install and record your first run
 
-## What's here
-
-The current MVP includes:
-
-- **Command recording** - wrap a local command and capture status, timing, stdout, stderr, and trace metadata.
-- **Git file-change capture** - opt in to an isolated before/after working-tree diff with structured file metadata.
-- **Trace contract** - `tracord.trace.v0`, documented in [docs/trace-v0.md](docs/trace-v0.md) with a JSON Schema in [schemas/trace-v0.schema.json](schemas/trace-v0.schema.json).
-- **Repository assertions** - check status, exit code, timeout behavior, duration, and artifact contents from versioned, reviewable cases.
-- **Portable bundles** - export and import `.tracord.zip` bundles with path traversal protections.
-- **Safe export preview** - inspect bundle contents with count-only secret findings and a strict CI gate before writing.
-- **Replay** - re-run the command from a recorded trace and store the replay as a new run.
-- **Local-first storage** - traces are stored under `.tracord/runs/` by default.
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
-
-## Run it locally
+Tracord currently installs from source and requires Python 3.11 or newer.
 
 ```bash
 git clone https://github.com/ajillepalli/Tracord.git
 cd Tracord
 python -m venv .venv
-.venv/Scripts/activate  # or source .venv/bin/activate on macOS/Linux
+```
+
+Activate the environment:
+
+```powershell
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+```
+
+```bash
+# macOS or Linux
+source .venv/bin/activate
+```
+
+Install Tracord and record a command:
+
+```bash
 python -m pip install -e .
-tracord --version
-```
-
-You can also run from source without installing:
-
-```bash
-cd src
-python -m tracord.cli --version
-```
-
-## Quick workflow
-
-```bash
-tracord record -- python -c "print('hello from tracord')"
-tracord record --capture-diff -- python agent.py
+tracord record --name hello -- python -c "print('hello from tracord')"
 tracord list
+```
+
+The record command prints a run ID and stores the trace under `.tracord/runs/<run-id>/`. Use that ID in the commands below.
+
+## Common workflows
+
+```bash
+# Read the complete trace
 tracord inspect <run-id>
+
+# Check deterministic expectations
 tracord assert <run-id> --status passed --stdout-contains tracord
-tracord assert <run-id> --case smoke
+
+# Preview an export without writing a bundle
 tracord export <run-id> --preview
 tracord export <run-id> --preview --json --fail-on-findings
-tracord export <run-id> --output hello.tracord.zip
-tracord import hello.tracord.zip
+
+# Export, import, and replay
+tracord export <run-id> --output run.tracord.zip
+tracord import run.tracord.zip
 tracord replay <run-id>
 ```
 
-Recorded runs are stored locally under `.tracord/runs/`. Repository assertion
-cases live in `.tracord/assertions.json`, which is intentionally not ignored by
-Git. Exported bundles are zip archives with a `.tracord.zip` suffix.
-
-## Repository assertion files
-
-The `tracord.assertions.v0` format stores named deterministic checks alongside
-the repository:
-
-```json
-{
-  "schema_version": "tracord.assertions.v0",
-  "cases": {
-    "smoke": {
-      "status": "passed",
-      "exit_code": 0,
-      "stdout_contains": "ready",
-      "no_timeout": true
-    }
-  }
-}
-```
-
-`tracord assert <run-id> --case smoke` loads the default file from the selected
-store. `--file PATH` selects another file, requires `--case`, and resolves a
-relative path from the current directory. File mode cannot be mixed with inline
-expectation flags. Both modes require at least one expectation.
-
-Assertion files are strict UTF-8 JSON and are limited to 1 MiB and 256 cases.
-Case names use portable ASCII letters, digits, `.`, `_`, and `-`, are unique
-under ASCII case folding, and contain at most 128 characters. Containment values
-are limited to 65,536 UTF-8 bytes. Evaluation reads `trace.json` through a
-bounded 16 MiB descriptor and scans regular, single-link stdout and stderr
-artifacts with 10 MiB per-file and 16 MiB aggregate coverage. A positive match
-within verified coverage passes that field; a negative result that reaches a
-coverage limit reports `scan_incomplete` rather than a plain mismatch.
-
-Assertion commands return `0` when every expectation passes, `1` for a trace or
-expectation failure, and `2` for invalid mode, values, files, or case selection.
-Diagnostics use fixed codes and do not echo assertion contents, paths, run IDs,
-unvalidated case input, or raw filesystem errors. Validated repository case
-names may appear only inside bounded logical schema locations.
-
-File diff capture is opt-in because patches may contain sensitive source and data. See [docs/file-diff-capture.md](docs/file-diff-capture.md) for scope, redaction behavior, and limits.
-
-Export preview reads the raw trace and referenced artifacts without writing a
-bundle. Its strict gate returns exit code `3` for live secret findings, a
-blocked or unknown export preflight, or incomplete scan coverage. See
-[docs/bundle-v0.md](docs/bundle-v0.md) for limits and security semantics.
-
-## Testing
+For CI, add `--json` to a core command. `record` requires it before the child
+separator:
 
 ```bash
-python -m pip install -e .
-python -m pytest
+tracord record --json -- python agent.py
+tracord assert --json <run-id> --status passed
+tracord list --json
+tracord replay --json <run-id>
 ```
 
-The current suite covers recording, assertions, schema validation, bundle import/export, replay, and unsafe path rejection.
+These commands emit one versioned, compact JSON object plus LF and keep child
+commands, captured output, paths, and raw exceptions out of the result. Treat a
+list as complete only when `skipped` is zero and `truncated` is false. See
+[CI JSON output](docs/ci-json-output.md) for schemas, exit behavior, privacy
+fields, and scanner limits.
 
-## Repository shape
+Capture a before/after Git diff only when you need it, because patches can contain source code or sensitive data:
 
-```text
-src/tracord/              # CLI and core recording code
-tests/                    # unit tests
-docs/                     # architecture, roadmap, trace and bundle docs
-schemas/                  # machine-readable trace schemas
-.github/                  # issue templates and PR checklist
-.tracord/assertions.json  # repository-owned assertion cases
-.tracord/runs/            # local runtime store, ignored by Git
+```bash
+tracord record --capture-diff -- python agent.py
 ```
 
-## Contributing
+Repository-owned assertion cases live in `.tracord/assertions.json`. See the [assertion schema](schemas/assertions-v0.schema.json) for the file format and [Contributing](CONTRIBUTING.md) for the test setup.
 
-Tracord uses a review-heavy workflow for meaningful changes: planning, design review, engineering review, adversarial review, issue filing, implementation, PR, another adversarial review, fixes, and merge. See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md).
+## Documentation
+
+| Document | What it covers |
+| --- | --- |
+| [Architecture](docs/ARCHITECTURE.md) | Components, storage, safety boundaries, and near-term direction |
+| [Trace v0](docs/trace-v0.md) | Human-readable trace contract |
+| [Trace v0 JSON Schema](schemas/trace-v0.schema.json) | Machine-readable trace validation |
+| [Assertion v0 JSON Schema](schemas/assertions-v0.schema.json) | Repository assertion-file contract |
+| [CI JSON output](docs/ci-json-output.md) | Core command result schemas, wire behavior, privacy, and list completeness |
+| [Bundle v0](docs/bundle-v0.md) | Export, import, preview, replay, and archive safety |
+| [File diff capture](docs/file-diff-capture.md) | Git capture model, privacy behavior, and limits |
+| [Roadmap](docs/ROADMAP.md) | Planned releases and open product questions |
+| [Changelog](CHANGELOG.md) | Notable shipped and unreleased changes |
+| [Contributing](CONTRIBUTING.md) | Development setup, tests, workflow, and repository layout |
+| [Security](SECURITY.md) | Private vulnerability reporting and trace-handling guidance |
+| [Code of conduct](CODE_OF_CONDUCT.md) | Community expectations |
+| [Agent workflow](AGENTS.md) | Required review sequence for repository agents |
+
+The in-package schemas define the shipped versioned CI result payloads:
+[record](src/tracord/schemas/record-result-v0.schema.json),
+[replay](src/tracord/schemas/replay-result-v0.schema.json),
+[assert](src/tracord/schemas/assertion-result-v0.schema.json), and
+[list](src/tracord/schemas/list-result-v0.schema.json).
 
 ## Security
 
-Tracord may process sensitive prompts, command output, file paths, tool inputs, and trace artifacts. Do not publish secrets or private traces in public issues. See [SECURITY.md](SECURITY.md).
-
-## Code of conduct
-
-See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+Traces may contain prompts, command output, paths, tool inputs, patches, and secrets. Review recordings before sharing them, use export preview as a safety check rather than a guarantee, and report vulnerabilities through the private process in [SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -177,14 +177,31 @@ def redact_text(value: str) -> str:
 
 def sanitize_label(value: str) -> str:
     """Redact and escape untrusted text before terminal or JSON display."""
-    characters: list[str] = []
+    tokens: list[str] = []
+    token_chars = 0
+    truncated = False
     for character in redact_text(value):
+        codepoint = ord(character)
         category = unicodedata.category(character)
-        if category.startswith("C") or category in {"Zl", "Zp"}:
-            characters.append(f"\\u{ord(character):04x}")
+        if character == "\\":
+            token = "\\\\"
+        elif (
+            category.startswith("C")
+            or category in {"Zl", "Zp"}
+            or 0xFE00 <= codepoint <= 0xFE0F
+            or 0xE0100 <= codepoint <= 0xE01EF
+        ):
+            token = (
+                f"\\u{codepoint:04x}"
+                if codepoint <= 0xFFFF
+                else f"\\U{codepoint:08x}"
+            )
         else:
-            characters.append(character)
-    sanitized = "".join(characters)
-    if len(sanitized) > MAX_DISPLAY_LABEL_CHARS:
-        return sanitized[:MAX_DISPLAY_LABEL_CHARS] + "...[TRUNCATED]"
-    return sanitized
+            token = character
+        if token_chars + len(token) > MAX_DISPLAY_LABEL_CHARS:
+            truncated = True
+            break
+        tokens.append(token)
+        token_chars += len(token)
+    sanitized = "".join(tokens)
+    return sanitized + "...[TRUNCATED]" if truncated else sanitized

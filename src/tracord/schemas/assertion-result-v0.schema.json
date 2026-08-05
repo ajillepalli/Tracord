@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracord.dev/schemas/assertion-result-v0.schema.json",
+  "title": "Tracord Assertion Result v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["result_version", "command", "ok", "exit_code", "error", "outcome", "run_id", "source", "case", "failures", "error_location"],
+  "properties": {
+    "result_version": {"const": "tracord.assertion-result.v0"},
+    "command": {"const": "assert"},
+    "ok": {"type": "boolean"},
+    "exit_code": {"type": "integer", "minimum": 0, "maximum": 2},
+    "error": {
+      "type": ["string", "null"],
+      "enum": [null, "assertion_file_missing", "assertion_file_unreadable", "assertion_file_not_regular", "assertion_file_changed", "assertion_file_too_large", "assertion_file_bom", "assertion_file_invalid_utf8", "assertion_file_duplicate_key", "assertion_file_invalid_json", "assertion_file_schema_invalid", "case_not_found", "assertion_value_invalid", "assertion_no_expectations", "invalid_run_id", "run_not_found", "trace_missing", "trace_unreadable", "trace_invalid", "run_identity_mismatch", "run_identity_unverifiable", "assertion_mode_conflict", "assert_failed", "assert_result_invalid"]
+    },
+    "outcome": {"enum": ["pass", "mismatch", "indeterminate", "error"]},
+    "run_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+    "source": {"enum": ["inline", "file"]},
+    "case": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+    "failures": {"type": "array", "maxItems": 6, "items": {"$ref": "#/$defs/failure"}},
+    "error_location": {
+      "type": ["string", "null"],
+      "pattern": "^(?:(?:status|exit_code|stdout_contains|stderr_contains|max_duration_ms|no_timeout|schema_version|cases(?:\\.[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\\.(?:status|exit_code|stdout_contains|stderr_contains|max_duration_ms|no_timeout))?)?))(?![\\s\\S])"
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"source": {"const": "inline"}}, "required": ["source"]},
+      "then": {"properties": {"case": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "pass"}}, "required": ["outcome"]},
+      "then": {"properties": {"ok": {"const": true}, "exit_code": {"const": 0}, "error": {"type": "null"}, "failures": {"maxItems": 0}, "error_location": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "mismatch"}}, "required": ["outcome"]},
+      "then": {"properties": {"ok": {"const": false}, "exit_code": {"const": 1}, "error": {"type": "null"}, "failures": {"minItems": 1, "items": {"allOf": [{"$ref": "#/$defs/failure"}, {"properties": {"kind": {"const": "mismatch"}}}]}}, "error_location": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "indeterminate"}}, "required": ["outcome"]},
+      "then": {"properties": {"ok": {"const": false}, "exit_code": {"const": 1}, "error": {"type": "null"}, "failures": {"minItems": 1, "contains": {"properties": {"kind": {"const": "indeterminate"}}, "required": ["kind"]}}, "error_location": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "error"}}, "required": ["outcome"]},
+      "then": {"properties": {"ok": {"const": false}, "exit_code": {"minimum": 1}, "error": {"type": "string"}, "failures": {"maxItems": 0}}}
+    }
+  ],
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?![\\s\\S])"},
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "kind", "location"],
+      "properties": {
+        "code": {"enum": ["assertion_mismatch", "artifact_unreadable", "artifact_invalid_utf8", "artifact_decode_replaced", "artifact_decode_unknown", "artifact_changed", "scan_incomplete"]},
+        "kind": {"enum": ["mismatch", "indeterminate"]},
+        "location": {"enum": ["status", "exit_code", "stdout_contains", "stderr_contains", "max_duration_ms", "no_timeout"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"code": {"const": "assertion_mismatch"}}, "required": ["code"]},
+          "then": {"properties": {"kind": {"const": "mismatch"}}},
+          "else": {"properties": {"kind": {"const": "indeterminate"}}}
+        }
+      ]
+    }
+  }
+}

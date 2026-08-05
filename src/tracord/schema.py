@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import math
 from typing import Any
+
+from .result_codes import (
+    DECODE_REPLACEMENT_STATES,
+    MAX_PROCESS_EXIT_CODE,
+    MAX_SAFE_JSON_INTEGER,
+    MIN_PROCESS_EXIT_CODE,
+)
 
 
 SCHEMA_VERSION = "tracord.trace.v0"
@@ -33,6 +41,8 @@ def validate_trace(trace: Mapping[str, Any]) -> list[str]:
 
     if trace_nesting_exceeded(trace):
         errors.append(f"trace nesting must not exceed {MAX_TRACE_NESTING_DEPTH}")
+    if not _json_numbers_safe(trace):
+        errors.append("trace numbers must be finite JSON-safe values")
 
     for field in REQUIRED_FIELDS:
         if field not in trace:
@@ -58,18 +68,40 @@ def validate_trace(trace: Mapping[str, Any]) -> list[str]:
         errors.append("cwd must be a non-empty string")
 
     duration_ms = trace.get("duration_ms")
-    if not isinstance(duration_ms, int) or duration_ms < 0:
-        errors.append("duration_ms must be a non-negative integer")
+    if (
+        not isinstance(duration_ms, int)
+        or isinstance(duration_ms, bool)
+        or not 0 <= duration_ms <= MAX_SAFE_JSON_INTEGER
+    ):
+        errors.append("duration_ms must be a non-negative JSON-safe integer")
 
     exit_code = trace.get("exit_code")
-    if exit_code is not None and not isinstance(exit_code, int):
-        errors.append("exit_code must be an integer or null")
+    if exit_code is not None and (
+        not isinstance(exit_code, int)
+        or isinstance(exit_code, bool)
+        or not MIN_PROCESS_EXIT_CODE <= exit_code <= MAX_PROCESS_EXIT_CODE
+    ):
+        errors.append("exit_code must be a supported process integer or null")
 
     if not isinstance(trace.get("timed_out"), bool):
         errors.append("timed_out must be a boolean")
 
     if not isinstance(trace.get("redacted"), bool):
         errors.append("redacted must be a boolean")
+
+    replacement = trace.get("decode_replacement")
+    if replacement is not None and (
+        not isinstance(replacement, Mapping)
+        or set(replacement) != {"stdout", "stderr"}
+        or replacement.get("stdout") not in DECODE_REPLACEMENT_STATES
+        or replacement.get("stderr") not in DECODE_REPLACEMENT_STATES
+    ):
+        errors.append("decode_replacement must contain approved stdout and stderr states")
+
+    if "store_identity_verified" in trace and not isinstance(
+        trace.get("store_identity_verified"), bool
+    ):
+        errors.append("store_identity_verified must be a boolean")
 
     artifacts = trace.get("artifacts")
     if not isinstance(artifacts, Mapping):
@@ -106,11 +138,32 @@ def trace_nesting_exceeded(value: object) -> bool:
         current, depth = pending.pop()
         if not isinstance(current, (Mapping, list)):
             continue
-        if depth > MAX_TRACE_NESTING_DEPTH:
+        if depth >= MAX_TRACE_NESTING_DEPTH:
             return True
         children = current.values() if isinstance(current, Mapping) else current
         pending.extend((child, depth + 1) for child in children)
     return False
+
+
+def _json_numbers_safe(value: object) -> bool:
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, bool) or current is None:
+            continue
+        if isinstance(current, int):
+            if not -MAX_SAFE_JSON_INTEGER <= current <= MAX_SAFE_JSON_INTEGER:
+                return False
+            continue
+        if isinstance(current, float):
+            if not math.isfinite(current):
+                return False
+            continue
+        if isinstance(current, Mapping):
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return True
 
 
 def _is_non_empty_string_sequence(value: object) -> bool:
@@ -136,9 +189,11 @@ def _validate_file_changes(
 
     changed_files = value.get("changed_files")
     if changed_files is not None and (
-        not isinstance(changed_files, int) or isinstance(changed_files, bool) or changed_files < 0
+        not isinstance(changed_files, int)
+        or isinstance(changed_files, bool)
+        or not 0 <= changed_files <= MAX_SAFE_JSON_INTEGER
     ):
-        errors.append("file_changes.changed_files must be a non-negative integer")
+        errors.append("file_changes.changed_files must be a non-negative JSON-safe integer")
 
     files = value.get("files")
     if files is not None:

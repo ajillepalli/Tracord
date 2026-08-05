@@ -15,6 +15,10 @@ src/tracord/
   bundle.py       # portable .tracord.zip import/export
   export_preview.py # bounded, read-only export safety inspection
   replay.py       # command replay
+  trace_access.py # exact bounded trace resolution and parsing
+  run_listing.py  # shared bounded text/JSON listing
+  result_codes.py # leaf-owned CI result constants and error vocabularies
+  ci_output.py    # CI projections, result builders, schemas, and one-shot emitter
   redaction.py    # named redaction rules and count-only summaries
   paths.py        # safe relative path handling
   git_capture.py  # isolated Git before/after snapshots
@@ -80,10 +84,15 @@ aggregate limits. A match in verified covered bytes satisfies its field, while
 an uncovered negative result is `scan_incomplete`; a match never bypasses
 identity or snapshot verification.
 
-The CLI keeps result classes stable: `0` passes, `1` represents trace or
-expectation failure, and `2` represents invocation, assertion-file, value, or
-case-selection errors. Public diagnostics are closed fixed codes and never
+The CLI keeps result classes stable: `0` passes; `1` represents trace,
+expectation, evaluation, or internal failure; and `2` represents recognized
+invocation, assertion-file, value, or case-selection errors. Public diagnostics are closed fixed codes and never
 include untrusted IDs, paths, values, content, or raw exceptions.
+
+Assertions now share exact directory resolution, descriptor-bounded trace reads,
+strict JSON parsing, and final identity verification with replay and inspect.
+Artifact evaluation retains its assertion-specific byte limits and failure
+locations after the common trace has been established.
 
 The v0 assertion code vocabulary is closed. Invocation and file errors are
 `invalid_run_id`, `assertion_mode_conflict`, `assertion_no_expectations`,
@@ -92,11 +101,32 @@ The v0 assertion code vocabulary is closed. Invocation and file errors are
 `assertion_file_changed`, `assertion_file_too_large`, `assertion_file_bom`,
 `assertion_file_invalid_utf8`, `assertion_file_duplicate_key`,
 `assertion_file_invalid_json`, `assertion_file_schema_invalid`, and
-`case_not_found`. Evaluation errors are `run_not_found`, `trace_unreadable`,
-`trace_invalid`, `run_identity_mismatch`, `artifact_unreadable`,
-`artifact_invalid_utf8`, `artifact_changed`, `assertion_mismatch`, and
-`scan_incomplete`. Adding a public code or expectation field requires a new
-assertion format version.
+`case_not_found`. Evaluation errors are `run_not_found`, `trace_missing`,
+`trace_unreadable`, `trace_invalid`, `run_identity_mismatch`,
+`run_identity_unverifiable`, `artifact_unreadable`, `artifact_invalid_utf8`,
+`artifact_decode_replaced`, `artifact_decode_unknown`, `artifact_changed`,
+`assertion_mismatch`, and `scan_incomplete`. Adding a public code or expectation
+field requires a new assertion format version.
+
+## CI Result Model
+
+`record`, `replay`, `assert`, and `list` each have a separate frozen v0 result
+schema. `result_codes.py` owns shared constants without importing runtime code;
+`ci_output.py` owns privacy projections, cross-field validation, compact sorted
+serialization, and the one-shot stdout emitter. Runtime modules raise typed,
+path-free errors and the CLI maps them into the command-specific vocabulary.
+
+Text and JSON list output share `run_listing.py`. It retains only bounded valid
+ASCII/portable candidates, reads single-link traces through verified descriptors,
+applies the canonical trace schema, and records skipped versus truncated work.
+The scanner is read-only when the store is missing. See
+[ci-json-output.md](ci-json-output.md) for the wire contract and exact limits.
+
+`trace_access.py` validates run IDs before path construction, resolves exact
+on-disk spelling, distinguishes detected replacement from unavailable identity,
+and re-verifies the store, run directory, descriptor, and trace ID after a
+bounded read. Replay fails closed before executing trace-controlled commands.
+Inspect uses the same access path but remains a deliberately sensitive raw view.
 
 ## File Change Model
 

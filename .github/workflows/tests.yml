@@ -18,12 +18,55 @@ jobs:
         include:
           - os: macos-latest
             python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: ubuntu-latest
+            python-version: "3.14"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install -e .
-      - run: python -m pip install pytest
+      - run: python -m pip install -e ".[test]"
       - run: python -m pytest
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install build
+      - run: python -m build
+      - name: Verify packaged CI schemas
+        shell: python
+        run: |
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          expected = {
+              "record-result-v0.schema.json",
+              "replay-result-v0.schema.json",
+              "assertion-result-v0.schema.json",
+              "list-result-v0.schema.json",
+          }
+          wheel = next(Path("dist").glob("*.whl"))
+          sdist = next(Path("dist").glob("*.tar.gz"))
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_schemas = {
+                  Path(name).name
+                  for name in archive.namelist()
+                  if Path(name).parts[:2] == ("tracord", "schemas")
+                  and name.endswith(".json")
+              }
+          with tarfile.open(sdist) as archive:
+              sdist_schemas = {
+                  Path(name).name
+                  for name in archive.getnames()
+                  if Path(name).parts[1:4] == ("src", "tracord", "schemas")
+                  and name.endswith(".json")
+              }
+          assert wheel_schemas == expected
+          assert sdist_schemas == expected

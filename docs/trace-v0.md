@@ -35,6 +35,10 @@ The initial command recorder emits:
 
 Future event types should be additive and should not require changing the top-level trace shape.
 
+Safe trace readers reject JSON with more than 256 simultaneously open
+containers, including the root. This canonical bound applies to list, inspect,
+replay, and assertions.
+
 ## Artifacts
 
 Artifact paths are relative to the directory containing `trace.json`. v0 command traces write:
@@ -49,6 +53,22 @@ A trace with a captured Git patch also writes `changes.patch` and references it 
 When capture is requested, `file_changes` records a status, structured changed-file list, configured size limit, and optional patch metadata. Status is one of `captured`, `unchanged`, `skipped`, `omitted`, or `error`. The same object is emitted as the `file.diff` event data.
 
 This field is additive: traces recorded without `--capture-diff` do not contain it and remain valid `tracord.trace.v0` traces.
+
+## Optional Recording Metadata
+
+Current recorders also write:
+
+- `output_encoding`: the platform-preferred encoding used to decode child bytes.
+- `decode_replacement`: `stdout` and `stderr` values of `none`, `present`, or
+  `unknown`, describing whether decoder replacement was observed.
+- `store_identity_verified`: whether the recording filesystem exposed stable
+  identity evidence for the store during publication.
+
+These fields are additive for trace-v0 compatibility. Missing decode metadata is
+treated as `none` for completed legacy traces and `unknown` for legacy timeout
+traces; missing store identity metadata is treated as unverified.
+Decoder replacement does not prove byte integrity or a universal encoding.
+Recorder text normalizes CRLF and CR line endings to LF after decoding.
 
 ## Privacy
 

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracord.dev/schemas/list-result-v0.schema.json",
+  "title": "Tracord List Result v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["result_version", "command", "ok", "exit_code", "error", "runs", "skipped", "truncated"],
+  "properties": {
+    "result_version": {"const": "tracord.list-result.v0"},
+    "command": {"const": "list"},
+    "ok": {"type": "boolean"},
+    "exit_code": {"type": "integer", "minimum": 0, "maximum": 2},
+    "error": {"type": ["string", "null"], "enum": [null, "list_store_unreadable", "list_failed", "list_result_invalid"]},
+    "runs": {"type": "array", "maxItems": 1000, "items": {"$ref": "#/$defs/listRun"}},
+    "skipped": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "truncated": {"type": "boolean"}
+  },
+  "oneOf": [
+    {
+      "properties": {"ok": {"const": true}, "exit_code": {"const": 0}, "error": {"type": "null"}}
+    },
+    {
+      "properties": {"ok": {"const": false}, "exit_code": {"minimum": 1}, "error": {"type": "string"}, "runs": {"maxItems": 0}, "skipped": {"const": 0}, "truncated": {"const": false}}
+    }
+  ],
+  "$defs": {
+    "listRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "status", "process_exit_code", "timed_out", "duration_ms", "redacted"],
+      "properties": {
+        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?![\\s\\S])"},
+        "status": {"enum": ["passed", "failed", "timeout"]},
+        "process_exit_code": {"type": ["integer", "null"], "minimum": -2147483648, "maximum": 4294967295},
+        "timed_out": {"type": "boolean"},
+        "duration_ms": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "redacted": {"type": "boolean"}
+      }
+    }
+  }
+}
