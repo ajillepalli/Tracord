@@ -15,7 +15,7 @@ Tracord is pre-1.0. The roadmap is intentionally biased toward reliability primi
 - File diff capture. (implemented)
 - Export preview with redaction summary. (implemented)
 - Assertion files checked into repositories. (implemented)
-- Better CLI output for CI.
+- Versioned, privacy-safe CI JSON for record, replay, assert, and list. (implemented)
 
 ## v0.3
 

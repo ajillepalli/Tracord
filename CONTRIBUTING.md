@@ -11,7 +11,7 @@ git clone https://github.com/ajillepalli/Tracord.git
 cd Tracord
 python -m venv .venv
 .venv/Scripts/activate  # or source .venv/bin/activate on macOS/Linux
-python -m pip install -e .
+python -m pip install -e ".[test]"
 python -m pytest
 ```
 
@@ -81,6 +81,10 @@ src/tracord/              # CLI and core recording code
   bundle.py               # portable .tracord.zip import/export
   export_preview.py       # bounded, read-only export safety inspection
   replay.py               # command replay
+  trace_access.py         # exact bounded trace resolution and parsing
+  run_listing.py          # shared bounded text/JSON run scanner
+  result_codes.py         # stable CI result constants and error vocabularies
+  ci_output.py            # privacy projections, result builders, and JSON emitter
   redaction.py            # named redaction rules and count-only summaries
   paths.py                # safe relative path handling
   git_capture.py          # isolated Git before/after snapshots
@@ -89,6 +93,11 @@ docs/                     # architecture, roadmap, trace and bundle docs
 schemas/                  # machine-readable trace schemas
 .github/                  # issue templates and PR checklist
 ```
+
+Changes to core JSON results must update the matching packaged schema, unit
+constructor tests, and real subprocess tests for both `python -m tracord` and the
+installed `tracord` console entry point. See
+[CI JSON output](docs/ci-json-output.md) for the frozen wire contract.
 
 ## Commit messages
 

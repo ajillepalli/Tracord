@@ -50,6 +50,21 @@ When capture is requested, `file_changes` records a status, structured changed-f
 
 This field is additive: traces recorded without `--capture-diff` do not contain it and remain valid `tracord.trace.v0` traces.
 
+## Optional Recording Metadata
+
+Current recorders also write:
+
+- `output_encoding`: the platform-preferred encoding used to decode child bytes.
+- `decode_replacement`: `stdout` and `stderr` values of `none`, `present`, or
+  `unknown`, describing whether decoder replacement was observed.
+- `store_identity_verified`: whether the recording filesystem exposed stable
+  identity evidence for the store during publication.
+
+These fields are additive for trace-v0 compatibility. Missing decode metadata is
+treated as `unknown`; missing store identity metadata is treated as unverified.
+Decoder replacement does not prove byte integrity or a universal encoding.
+Recorder text normalizes CRLF and CR line endings to LF after decoding.
+
 ## Privacy
 
 Tracord defaults to redacting obvious secrets from command output before writing artifacts. Redaction is best effort and not a complete DLP system.

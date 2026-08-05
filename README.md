@@ -68,6 +68,22 @@ tracord import run.tracord.zip
 tracord replay <run-id>
 ```
 
+For CI, add `--json` to a core command. `record` requires it before the child
+separator:
+
+```bash
+tracord record --json -- python agent.py
+tracord assert --json <run-id> --status passed
+tracord list --json
+tracord replay --json <run-id>
+```
+
+These commands emit one versioned, compact JSON object plus LF and keep child
+commands, captured output, paths, and raw exceptions out of the result. Treat a
+list as complete only when `skipped` is zero and `truncated` is false. See
+[CI JSON output](docs/ci-json-output.md) for schemas, exit behavior, privacy
+fields, and scanner limits.
+
 Capture a before/after Git diff only when you need it, because patches can contain source code or sensitive data:
 
 ```bash
@@ -84,6 +100,7 @@ Repository-owned assertion cases live in `.tracord/assertions.json`. See the [as
 | [Trace v0](docs/trace-v0.md) | Human-readable trace contract |
 | [Trace v0 JSON Schema](schemas/trace-v0.schema.json) | Machine-readable trace validation |
 | [Assertion v0 JSON Schema](schemas/assertions-v0.schema.json) | Repository assertion-file contract |
+| [CI JSON output](docs/ci-json-output.md) | Core command result schemas, wire behavior, privacy, and list completeness |
 | [Bundle v0](docs/bundle-v0.md) | Export, import, preview, replay, and archive safety |
 | [File diff capture](docs/file-diff-capture.md) | Git capture model, privacy behavior, and limits |
 | [Roadmap](docs/ROADMAP.md) | Planned releases and open product questions |
@@ -93,7 +110,11 @@ Repository-owned assertion cases live in `.tracord/assertions.json`. See the [as
 | [Code of conduct](CODE_OF_CONDUCT.md) | Community expectations |
 | [Agent workflow](AGENTS.md) | Required review sequence for repository agents |
 
-The in-package schemas define the versioned CI result payloads under development: [record](src/tracord/schemas/record-result-v0.schema.json), [replay](src/tracord/schemas/replay-result-v0.schema.json), [assert](src/tracord/schemas/assertion-result-v0.schema.json), and [list](src/tracord/schemas/list-result-v0.schema.json).
+The in-package schemas define the shipped versioned CI result payloads:
+[record](src/tracord/schemas/record-result-v0.schema.json),
+[replay](src/tracord/schemas/replay-result-v0.schema.json),
+[assert](src/tracord/schemas/assertion-result-v0.schema.json), and
+[list](src/tracord/schemas/list-result-v0.schema.json).
 
 ## Security
 

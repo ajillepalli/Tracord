@@ -76,6 +76,26 @@
     "redacted": {
       "type": "boolean"
     },
+    "output_encoding": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decode_replacement": {
+      "type": "object",
+      "required": ["stdout", "stderr"],
+      "additionalProperties": false,
+      "properties": {
+        "stdout": {
+          "enum": ["none", "present", "unknown"]
+        },
+        "stderr": {
+          "enum": ["none", "present", "unknown"]
+        }
+      }
+    },
+    "store_identity_verified": {
+      "type": "boolean"
+    },
     "artifacts": {
       "type": "object",
       "required": ["stdout", "stderr"],
