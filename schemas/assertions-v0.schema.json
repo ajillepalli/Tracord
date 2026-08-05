@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracord.dev/schemas/assertions-v0.schema.json",
+  "title": "Tracord Assertions v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "cases"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "tracord.assertions.v0"
+    },
+    "cases": {
+      "type": "object",
+      "maxProperties": 256,
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/case"
+      }
+    }
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 6,
+      "properties": {
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "timeout"
+          ]
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "stdout_contains": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536
+        },
+        "stderr_contains": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536
+        },
+        "max_duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "no_timeout": {
+          "const": true
+        }
+      }
+    }
+  }
+}

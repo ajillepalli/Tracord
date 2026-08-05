@@ -1,0 +1,12 @@
+{
+  "schema_version": "tracord.assertions.v0",
+  "cases": {
+    "smoke": {
+      "status": "passed",
+      "exit_code": 0,
+      "stdout_contains": "ready",
+      "max_duration_ms": 5000,
+      "no_timeout": true
+    }
+  }
+}
