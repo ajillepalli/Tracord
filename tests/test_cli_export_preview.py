@@ -52,6 +52,30 @@ def test_json_writer_uses_lf_bytes(monkeypatch):
     assert stdout.buffer.getvalue() == b'{"status":"ok"}\n'
 
 
+def test_human_preview_writes_utf8_when_stdout_is_redirected(tmp_path: Path, monkeypatch):
+    store = tmp_path / "store"
+    run_id, trace_directory = _record(store)
+    trace_path = trace_directory / "trace.json"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    trace["artifacts"]["unicode"] = "snowman-\u2603.log"
+    trace_path.write_text(json.dumps(trace), encoding="utf-8")
+
+    class BinaryStdout:
+        def __init__(self):
+            self.buffer = io.BytesIO()
+
+        def flush(self):
+            pass
+
+    stdout = BinaryStdout()
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    exit_code = main(["export", "--store", str(store), "--preview", run_id])
+
+    assert exit_code == 0
+    assert "snowman-\u2603.log" in stdout.buffer.getvalue().decode("utf-8")
+
+
 def test_strict_gate_uses_exit_three_and_never_prints_secret(tmp_path: Path, capsys):
     store = tmp_path / "store"
     run_id, trace_directory = _record(store)
@@ -213,8 +237,9 @@ def test_invalid_cli_scan_limit_is_usage_error_with_json(tmp_path: Path, capsys)
     assert json.loads(captured.out)["error"] == "invalid_scan_limit"
 
 
-def test_invalid_run_id_is_usage_error_with_json(tmp_path: Path, capsys):
-    exit_code = main(["export", "--preview", "--json", "."])
+@pytest.mark.parametrize("run_id", [".", "stream:name", "trailing.", "NUL"])
+def test_invalid_run_id_is_usage_error_with_json(tmp_path: Path, capsys, run_id: str):
+    exit_code = main(["export", "--preview", "--json", run_id])
     captured = capsys.readouterr()
 
     assert exit_code == 2

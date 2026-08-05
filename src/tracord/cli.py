@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import sys
+import zipfile
 from pathlib import Path
 from typing import cast
 
@@ -272,14 +273,14 @@ def print_export_preview(preview: dict[str, object]) -> None:
     findings = cast(dict[str, object], preview["findings"])
     coverage = "complete" if scan["complete"] else "incomplete"
     export_status = preview["export_preflight"]
-    print(
+    lines = [
         f"preview {preview['run_id_display']} export={export_status} scan={coverage}"
-    )
-    print(
+    ]
+    lines.append(
         f"files total={scan['files_total']} scanned={scan['files_scanned']} "
         f"skipped={scan['files_skipped']} bytes={scan['bytes_scanned']}"
     )
-    print(
+    lines.append(
         f"findings gating={findings['gating_total']} "
         f"advisory={findings['advisory_total']} "
         f"already-redacted={findings['already_redacted_total']}"
@@ -293,18 +294,28 @@ def print_export_preview(preview: dict[str, object]) -> None:
     ]
     for file in noteworthy[:MAX_TEXT_FILE_ENTRIES]:
         reason = f" reason={file['reason']}" if "reason" in file else ""
-        print(f"{file['status']} {file['path']}{reason}")
+        lines.append(f"{file['status']} {file['path']}{reason}")
     if len(noteworthy) > MAX_TEXT_FILE_ENTRIES:
-        print(f"additional noteworthy files={len(noteworthy) - MAX_TEXT_FILE_ENTRIES}")
+        lines.append(
+            f"additional noteworthy files={len(noteworthy) - MAX_TEXT_FILE_ENTRIES}"
+        )
     fail_reasons = preview["fail_reasons"]
     if isinstance(fail_reasons, list) and fail_reasons:
         gate_state = "failed" if preview["gate_enforced"] else "would fail"
-        print(f"gate {gate_state}: " + ", ".join(str(reason) for reason in fail_reasons))
+        lines.append(
+            f"gate {gate_state}: " + ", ".join(str(reason) for reason in fail_reasons)
+        )
+    _write_stdout("\n".join(lines) + "\n")
 
 
 def write_json_stdout(payload: dict[str, object]) -> None:
     """Write deterministic JSON with LF even when the Windows console translates text."""
     content = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    _write_stdout(content)
+
+
+def _write_stdout(content: str) -> None:
+    """Write UTF-8 bytes when stdout exposes its binary stream."""
     buffer = getattr(sys.stdout, "buffer", None)
     if buffer is None:
         sys.stdout.write(content)
@@ -318,7 +329,16 @@ def write_json_stdout(payload: dict[str, object]) -> None:
 def handle_import(args: argparse.Namespace) -> int:
     try:
         trace = import_bundle(root=Path(args.store), bundle_path=args.bundle, overwrite=args.overwrite)
-    except (FileExistsError, FileNotFoundError, OSError, ValueError) as exc:
+    except (
+        FileExistsError,
+        FileNotFoundError,
+        OSError,
+        ValueError,
+        RuntimeError,
+        RecursionError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as exc:
         print(f"tracord: {sanitize_label(str(exc))}", file=sys.stderr)
         return 1
     print(f"imported {sanitize_label(str(trace['run_id']))}")

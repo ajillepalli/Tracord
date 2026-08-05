@@ -3,12 +3,13 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
 
 import tracord.export_preview as preview_module
-from tracord.bundle import build_manifest, export_run
+from tracord.bundle import build_manifest, export_run, import_bundle
 from tracord.export_preview import ExportPreviewError, gate_reasons, preview_export
 from tracord.recorder import record_command
 from tracord.storage import read_json, run_dir, write_json
@@ -474,7 +475,7 @@ def test_invalid_utf8_trace_matches_export_failure(tmp_path: Path):
 
     with pytest.raises(ExportPreviewError) as preview_error:
         preview_export(root=store, run_id=run_id)
-    with pytest.raises(UnicodeDecodeError):
+    with pytest.raises(ValueError, match="trace is not valid JSON"):
         export_run(root=store, run_id=run_id, output_path=tmp_path / "run.zip")
 
     assert preview_error.value.code == "invalid_trace_json"
@@ -563,7 +564,7 @@ def test_hard_limits_cannot_be_expanded(tmp_path: Path, options):
     assert exc_info.value.code == "invalid_scan_limit"
 
 
-def test_trace_json_artifact_is_not_scanned_twice(tmp_path: Path):
+def test_trace_json_artifact_is_reported_as_reserved_without_duplicate_scan(tmp_path: Path):
     store = tmp_path / "store"
     run_id, trace_directory = _record(store)
     _add_artifact(trace_directory, "duplicate", "trace.json")
@@ -571,7 +572,11 @@ def test_trace_json_artifact_is_not_scanned_twice(tmp_path: Path):
     preview = preview_export(root=store, run_id=run_id)
 
     assert [file["id"] for file in preview["files"]].count("trace") == 1
-    assert preview["scan"]["files_total"] == 4
+    assert preview["scan"]["files_total"] == 5
+    assert preview["export_preflight"] == "blocked"
+    assert any(
+        file.get("reason") == "invalid_artifact_namespace" for file in preview["files"]
+    )
 
 
 def test_bounded_reader_receives_the_exact_file_limit(tmp_path: Path, monkeypatch):
@@ -664,6 +669,84 @@ def test_trace_failure_codes_are_explicit(tmp_path: Path, content: bytes, code: 
         preview_export(root=store, run_id=run_id)
 
     assert exc_info.value.code == code
+
+
+def test_deeply_nested_event_data_returns_fixed_error_code(tmp_path: Path):
+    store = tmp_path / "store"
+    run_id, trace_directory = _record(store)
+    trace_path = trace_directory / "trace.json"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    trace["events"] = [
+        {
+            "type": "nested",
+            "at": trace["started_at"],
+            "data": {"payload": "NESTED_PAYLOAD"},
+        }
+    ]
+    encoded = json.dumps(trace, separators=(",", ":"))
+    nested = "[" * 1200 + '"leaf"' + "]" * 1200
+    trace_path.write_text(
+        encoded.replace('"NESTED_PAYLOAD"', nested), encoding="utf-8"
+    )
+
+    with pytest.raises(ExportPreviewError) as exc_info:
+        preview_export(root=store, run_id=run_id)
+
+    assert exc_info.value.code == "invalid_trace"
+
+
+def test_shared_nesting_limit_aligns_preview_export_and_import(tmp_path: Path):
+    store = tmp_path / "store"
+    run_id, trace_directory = _record(store)
+    trace_path = trace_directory / "trace.json"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    trace["events"] = [
+        {
+            "type": "nested",
+            "at": trace["started_at"],
+            "data": {"payload": "NESTED_PAYLOAD"},
+        }
+    ]
+    encoded = json.dumps(trace, separators=(",", ":"))
+    nested = "[" * 300 + '"leaf"' + "]" * 300
+    trace_bytes = encoded.replace('"NESTED_PAYLOAD"', nested).encode("utf-8")
+    trace_path.write_bytes(trace_bytes)
+
+    with pytest.raises(ExportPreviewError) as preview_error:
+        preview_export(root=store, run_id=run_id)
+    with pytest.raises(ValueError, match="trace nesting"):
+        export_run(root=store, run_id=run_id, output_path=tmp_path / "export.zip")
+
+    bundle = tmp_path / "import.zip"
+    with zipfile.ZipFile(bundle, mode="w") as archive:
+        archive.writestr("trace.json", trace_bytes)
+        archive.writestr("stdout.log", "")
+        archive.writestr("stderr.log", "")
+    with pytest.raises(ValueError, match="trace nesting"):
+        import_bundle(root=tmp_path / "target", bundle_path=bundle)
+
+    assert preview_error.value.code == "invalid_trace"
+
+
+def test_partial_manifest_scan_handles_unicode_artifact_path(tmp_path: Path):
+    store = tmp_path / "store"
+    run_id, trace_directory = _record(store)
+    trace_path = trace_directory / "trace.json"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    trace["artifacts"]["unicode"] = "snowman-\u2603.log"
+    trace_path.write_text(json.dumps(trace), encoding="utf-8")
+    trace_size = trace_path.stat().st_size
+
+    preview = preview_export(
+        root=store,
+        run_id=run_id,
+        max_scan_bytes=trace_size,
+        max_total_scan_bytes=trace_size + 8,
+    )
+
+    manifest = next(file for file in preview["files"] if file["id"] == "manifest")
+    assert manifest["status"] == "aggregate_limit"
+    assert manifest["scanned_bytes"] == 8
 
 
 def test_trace_uses_aggregate_ceiling_independently_of_artifact_cap(tmp_path: Path):

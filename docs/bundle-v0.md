@@ -96,19 +96,40 @@ Binary and changed files can therefore increase both `bytes_read` and
 Preview describes files at scan time. A later export can observe changed files,
 so a clean preview is not proof that a later bundle is safe. On Windows,
 `O_NOFOLLOW` is unavailable; path and descriptor identity checks compensate but
-cannot make cross-platform races impossible. Windows junctions and other reparse
-link-like reparse points are rejected from `st_reparse_tag`, including on Python 3.11 where
-`Path.is_junction()` is unavailable. On POSIX, no-follow protects the
+cannot make cross-platform races impossible. Windows junctions and other
+link-like reparse points are rejected from `st_reparse_tag`, including on Python
+3.11 where `Path.is_junction()` is unavailable. On POSIX, no-follow protects the
 final component, while a hostile parent-directory replacement remains a residual
-race. Filesystems that do not provide stable inode identity are reported as
-unreadable. Read-only opens can update file access times on some filesystems.
-When inode identity is unavailable, preview scans with mode/size/mtime checks,
-marks coverage incomplete as `identity_unverified`, and leaves export possible.
+race. Read-only opens can update file access times on some filesystems. When
+inode identity is unavailable, preview scans with mode/size/mtime checks, marks
+coverage incomplete as `identity_unverified`, and leaves export possible.
 
 Normal export streams each source through the same descriptor used for its
 snapshot verification. Import rejects linked run directories and parents and
-writes members through no-follow descriptors. Hardlinks remain regular files and
-are intentionally out of scope for link rejection.
+writes members through exclusive, no-follow descriptors in a sibling staging
+directory. The completed directory replaces the target only after every member
+expected by the trace has been validated and extracted. Overwrite transactions
+hold an OS-level per-run lock and use a synced, phased recovery journal so an
+interrupted directory swap can restore the old run or finish committed cleanup
+on the next import. Transaction filenames use fixed-length hashes rather than
+run IDs. Hardlinks remain regular files and are
+intentionally out of scope for link rejection.
+
+Bundles are limited to 4,096 members, 100 MiB for each declared metadata member,
+and 1 GiB of total uncompressed content. Export enforces the same limits as
+import. Import validates declared sizes before creating a run and streams artifact members to
+the staging directory, preventing compressed bundles from causing unbounded
+memory use or publishing a partial run. Artifact paths must also form a portable,
+case-insensitive namespace: reserved metadata names, Windows device/ADS names,
+trailing-dot/space aliases, components over 128 UTF-8 bytes, and file/parent
+collisions are rejected. Run IDs use the same portable component rules.
+
+No-overwrite export first attempts atomic hardlink publication and falls back to
+the platform's atomic no-replace rename primitive (`renameat2` on Linux,
+`renamex_np` on macOS, and exclusive rename on Windows). Filesystems that support
+neither operation fail with a fixed operational error rather than exposing a
+partial bundle or overwriting a concurrent writer. Trace object nesting is
+limited to 256 container levels across preview, export, and import.
 
 Output includes exact file sizes, which are sensitive metadata. Do not publish
 preview JSON for private traces. Content hashes are intentionally omitted because

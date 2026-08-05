@@ -7,11 +7,19 @@ import os
 import re
 import stat
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .bundle import BUNDLE_VERSION, MANIFEST_FILE, TRACE_FILE, build_manifest
+from .bundle import (
+    BUNDLE_VERSION,
+    MANIFEST_FILE,
+    TRACE_FILE,
+    artifact_names as validated_artifact_names,
+    build_manifest,
+    validate_run_id,
+)
 from .paths import is_link_or_junction, validate_relative_path
 from .redaction import (
     REDACTION,
@@ -104,7 +112,9 @@ def preview_export(
         trace_result.payload["findings"] = _summary_payload(trace_result.summary)
 
     remaining_bytes -= trace_result.bytes_read
-    artifact_names, artifact_limit_exceeded = _artifact_names(trace, max_artifacts)
+    artifact_names, artifact_limit_exceeded, artifact_namespace_invalid = (
+        _artifact_names(trace, max_artifacts)
+    )
     files: list[dict[str, Any]] = [trace_result.payload]
     summaries = [trace_result.summary] if trace_result.summary is not None else []
     bytes_read = trace_result.bytes_read
@@ -116,7 +126,7 @@ def preview_export(
     manifest_bytes = len(manifest_data)
     manifest_scan_bytes = min(manifest_bytes, remaining_bytes)
     manifest_summary = summarize_redactions(
-        manifest_data[:manifest_scan_bytes].decode("utf-8")
+        manifest_data[:manifest_scan_bytes].decode("utf-8", errors="surrogateescape")
     )
     manifest_status = "scanned" if manifest_scan_bytes == manifest_bytes else "aggregate_limit"
     files.append(
@@ -159,8 +169,20 @@ def preview_export(
             )
         )
 
+    if artifact_namespace_invalid:
+        files.append(
+            _empty_file_payload(
+                file_id="artifact-namespace",
+                path="[unsafe artifact namespace]",
+                status="unsafe_path",
+                reason="invalid_artifact_namespace",
+            )
+        )
+
     aggregate_findings = _aggregate_summaries(summaries)
-    files_total = 2 + len(artifact_names) + omitted_files
+    files_total = (
+        2 + len(artifact_names) + omitted_files + int(artifact_namespace_invalid)
+    )
     fully_scanned = sum(
         1 for file in files if file["status"] == "scanned"
     )
@@ -255,8 +277,9 @@ def _validate_options(
         raise ExportPreviewError("invalid_scan_limit")
     if not isinstance(run_id, str):
         raise ExportPreviewError("invalid_run_id")
-    run_id_errors = validate_relative_path(run_id)
-    if run_id_errors or "/" in run_id:
+    try:
+        validate_run_id(run_id)
+    except ValueError:
         raise ExportPreviewError("invalid_run_id")
     if (
         max_scan_bytes <= 0
@@ -272,20 +295,25 @@ def _validate_options(
 
 def _artifact_names(
     trace: dict[str, Any], max_artifacts: int
-) -> tuple[list[str], bool]:
+) -> tuple[list[str], bool, bool]:
     artifacts = trace.get("artifacts")
     if not isinstance(artifacts, dict):
-        return [], False
+        return [], False, False
+    try:
+        validated_artifact_names(trace)
+        namespace_invalid = False
+    except ValueError:
+        namespace_invalid = True
     names: list[str] = []
     seen: set[str] = set()
     for value in artifacts.values():
         if not isinstance(value, str) or value == TRACE_FILE or value in seen:
             continue
         if len(names) >= max_artifacts:
-            return sorted(names), True
+            return sorted(names), True, namespace_invalid
         seen.add(value)
         names.append(value)
-    return sorted(names), False
+    return sorted(names), False, namespace_invalid
 
 
 def _scan_file(
@@ -547,15 +575,16 @@ def _summarize_all_command_secrets(trace: object) -> RedactionSummary:
     )
 
 
-def _string_lists(value: object):
-    if isinstance(value, list):
-        if value and all(isinstance(item, str) for item in value):
-            yield value
-        for item in value:
-            yield from _string_lists(item)
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from _string_lists(item)
+def _string_lists(value: object) -> Iterator[list[object]]:
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, list):
+            if current and all(isinstance(item, str) for item in current):
+                yield current
+            pending.extend(reversed(current))
+        elif isinstance(current, dict):
+            pending.extend(reversed(tuple(current.values())))
 
 
 def _combine_summaries(summaries: list[RedactionSummary]) -> RedactionSummary:

@@ -9,6 +9,7 @@ from typing import Any
 SCHEMA_VERSION = "tracord.trace.v0"
 STATUSES = {"passed", "failed", "timeout"}
 FILE_CHANGE_STATUSES = {"captured", "unchanged", "skipped", "omitted", "error"}
+MAX_TRACE_NESTING_DEPTH = 256
 REQUIRED_FIELDS = (
     "schema_version",
     "run_id",
@@ -29,6 +30,9 @@ REQUIRED_FIELDS = (
 
 def validate_trace(trace: Mapping[str, Any]) -> list[str]:
     errors: list[str] = []
+
+    if trace_nesting_exceeded(trace):
+        errors.append(f"trace nesting must not exceed {MAX_TRACE_NESTING_DEPTH}")
 
     for field in REQUIRED_FIELDS:
         if field not in trace:
@@ -94,6 +98,19 @@ def validate_trace(trace: Mapping[str, Any]) -> list[str]:
         _validate_file_changes(trace.get("file_changes"), artifacts, errors)
 
     return errors
+
+
+def trace_nesting_exceeded(value: object) -> bool:
+    pending = [(value, 0)]
+    while pending:
+        current, depth = pending.pop()
+        if not isinstance(current, (Mapping, list)):
+            continue
+        if depth > MAX_TRACE_NESTING_DEPTH:
+            return True
+        children = current.values() if isinstance(current, Mapping) else current
+        pending.extend((child, depth + 1) for child in children)
+    return False
 
 
 def _is_non_empty_string_sequence(value: object) -> bool:
