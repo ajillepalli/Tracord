@@ -12,6 +12,7 @@ src/tracord/
   schema.py       # lightweight trace validation
   assertions.py   # deterministic assertion evaluation
   bundle.py       # portable .tracord.zip import/export
+  export_preview.py # bounded, read-only export safety inspection
   replay.py       # command replay
   redaction.py    # named redaction rules and count-only summaries
   paths.py        # safe relative path handling
@@ -37,6 +38,15 @@ See [trace-v0.md](trace-v0.md) and [../schemas/trace-v0.schema.json](../schemas/
 Portable bundles are zip archives with a `.tracord.zip` suffix. Import rejects unsafe paths and writes only under the target run directory.
 
 See [bundle-v0.md](bundle-v0.md).
+
+Export preview is separate from archive writing. It opens referenced files with
+bounded read-only descriptors, rejects non-regular and unsafe paths, checks file
+identity around reads, and emits count-only results. This separation guarantees
+that preview has no explicit filesystem writes and does not create a store,
+output directory, or bundle. Read-only opens can still update access times, and
+cross-platform filesystem races remain a documented best-effort boundary.
+Normal export shares the same run-ID, real-directory, regular-file, and stable
+identity preflight so preview does not certify inputs that the writer rejects.
 
 ## File Change Model
 

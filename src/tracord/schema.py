@@ -40,6 +40,9 @@ def validate_trace(trace: Mapping[str, Any]) -> list[str]:
     if trace.get("kind") != "command":
         errors.append("kind must be command")
 
+    if not isinstance(trace.get("run_id"), str) or not trace.get("run_id"):
+        errors.append("run_id must be a non-empty string")
+
     if trace.get("status") not in STATUSES:
         errors.append("status must be one of: failed, passed, timeout")
 

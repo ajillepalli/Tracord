@@ -13,7 +13,7 @@ Tracord is pre-1.0. The roadmap is intentionally biased toward reliability primi
 ## v0.2
 
 - File diff capture. (implemented)
-- Export preview with redaction summary.
+- Export preview with redaction summary. (implemented)
 - Assertion files checked into repositories.
 - Better CLI output for CI.
 

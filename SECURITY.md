@@ -32,6 +32,15 @@ placeholders produced by full-match rules cannot be attributed afterward. Broad
 encoded-secret candidates are advisory to avoid treating common repository
 identifiers as confirmed secrets.
 
+Export preview is read-only and bounds work per file, across the run, and by
+artifact count. A strict preview gate fails when live findings exist, export is
+blocked or unknown, or any bytes could not be scanned. `--allow-incomplete-scan`
+is an explicit reduction in coverage assurance but never permits a blocked or
+unknown export. Preview is still best effort: files can change between preview
+and a later export, file sizes and labels are sensitive metadata, and the rules
+cannot prove that apparently clean content has no secret. Review sensitive
+traces before sharing them.
+
 ## Scope
 
 In scope:

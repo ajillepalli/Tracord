@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import stat
 import zipfile
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .paths import safe_join, validate_relative_path
+from .paths import is_link_or_junction, safe_join, validate_relative_path
 from .schema import validate_trace
 from .storage import ensure_store, read_json, run_dir, write_json
 
@@ -25,21 +26,23 @@ def export_run(
     output_path: Path | None = None,
     overwrite: bool = False,
 ) -> Path:
+    _validate_run_id(run_id)
     source_dir = run_dir(root, run_id)
+    _validate_run_directory(source_dir)
     trace_path = source_dir / TRACE_FILE
-    if not trace_path.exists():
-        raise FileNotFoundError(f"run not found: {run_id}")
+    _validate_export_file(source_dir, TRACE_FILE)
 
     trace = read_json(trace_path)
     errors = validate_trace(trace)
     if errors:
         raise ValueError("trace is invalid: " + "; ".join(errors))
+    if trace.get("run_id") != run_id:
+        raise ValueError("trace run id does not match requested run id")
 
     artifacts = _artifact_names(trace)
     files = [TRACE_FILE, *artifacts]
     for file_name in files:
-        if not safe_join(source_dir, file_name).exists():
-            raise FileNotFoundError(f"run artifact not found: {file_name}")
+        _validate_export_file(source_dir, file_name)
 
     if output_path is None:
         output_path = Path(f"{run_id}.tracord.zip")
@@ -115,6 +118,44 @@ def _validate_run_id(run_id: str) -> None:
         raise ValueError("invalid run id: " + "; ".join(errors or ["must be one path segment"]))
 
 
+def _validate_run_directory(source_dir: Path) -> None:
+    try:
+        runs_info = source_dir.parent.lstat()
+        info = source_dir.lstat()
+    except FileNotFoundError:
+        raise FileNotFoundError("run not found") from None
+    if (
+        is_link_or_junction(source_dir.parent, runs_info)
+        or not stat.S_ISDIR(runs_info.st_mode)
+        or is_link_or_junction(source_dir, info)
+        or not stat.S_ISDIR(info.st_mode)
+    ):
+        raise ValueError("run directory must be a real directory")
+
+
+def _validate_export_file(source_dir: Path, relative_path: str) -> None:
+    candidate = safe_join(source_dir, relative_path)
+    current = source_dir
+    for part in PurePosixPath(relative_path).parts[:-1]:
+        current /= part
+        try:
+            parent_info = current.lstat()
+        except FileNotFoundError:
+            raise FileNotFoundError("run artifact not found") from None
+        if is_link_or_junction(current, parent_info) or not stat.S_ISDIR(
+            parent_info.st_mode
+        ):
+            raise ValueError("run artifact parent must be a real directory")
+    try:
+        info = candidate.lstat()
+    except FileNotFoundError:
+        raise FileNotFoundError("run artifact not found") from None
+    if is_link_or_junction(candidate, info) or not stat.S_ISREG(info.st_mode):
+        raise ValueError("run artifact must be a regular file")
+    if info.st_ino == 0:
+        raise ValueError("run artifact identity is unavailable")
+
+
 def _remove_stale_artifacts(
     target_dir: Path,
     expected_files: set[str],
@@ -144,7 +185,7 @@ def _artifact_names(trace: dict[str, Any]) -> list[str]:
         errors = validate_relative_path(value)
         if errors:
             raise ValueError("invalid artifact path: " + "; ".join(errors))
-        if value not in names:
+        if value != TRACE_FILE and value not in names:
             names.append(value)
     return names
 
