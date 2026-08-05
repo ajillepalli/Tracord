@@ -63,12 +63,13 @@ For CI, use:
 tracord export <run-id> --preview --json --fail-on-findings
 ```
 
-The strict gate fails on gating findings, a blocked/unknown export preflight, or
-incomplete coverage. Broad encoded
+The strict gate fails on gating findings, a blocked/unknown export preflight,
+incomplete coverage, or unverified source identity. Broad encoded
 secret candidates are advisory and already-redacted named assignments are
 reported separately. `--allow-incomplete-scan` opts out of only the incomplete
 coverage failure; it does not suppress live findings, unsafe paths, missing
-files, unreadable files, or an unknown artifact-limit preflight.
+files, unreadable files, an unknown artifact-limit preflight, or
+`identity_unverified`.
 
 JSON and library results always report `fail_reasons`, even when `gate_enforced` is false and the
 command exits successfully. `export_preflight` is `ready`, `blocked`, or

@@ -251,6 +251,18 @@ def test_load_rejects_a_symlinked_parent(tmp_path: Path):
     assert caught.value.code == "assertion_file_unreadable"
 
 
+def test_load_resolves_parent_segments_lexically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    assertion_path = tmp_path / "assertions.json"
+    assertion_path.write_bytes(descriptor())
+    child = tmp_path / "child"
+    child.mkdir()
+    monkeypatch.chdir(child)
+
+    assert load_assertion_case(Path("../assertions.json"), "smoke").status == "passed"
+
+
 def test_load_fails_closed_when_snapshot_identity_is_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

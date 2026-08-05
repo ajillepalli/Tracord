@@ -108,7 +108,8 @@ coverage limit reports `scan_incomplete` rather than a plain mismatch.
 Assertion commands return `0` when every expectation passes, `1` for a trace or
 expectation failure, and `2` for invalid mode, values, files, or case selection.
 Diagnostics use fixed codes and do not echo assertion contents, paths, run IDs,
-case input, or raw filesystem errors.
+unvalidated case input, or raw filesystem errors. Validated repository case
+names may appear only inside bounded logical schema locations.
 
 File diff capture is opt-in because patches may contain sensitive source and data. See [docs/file-diff-capture.md](docs/file-diff-capture.md) for scope, redaction behavior, and limits.
 

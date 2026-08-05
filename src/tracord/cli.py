@@ -243,7 +243,7 @@ def handle_assert(args: argparse.Namespace) -> int:
         for failure in failures:
             _assert_error(failure.code, exit_code=1, location=failure.location)
         return 1
-    print(f"pass {on_disk_run_id}")
+    print(f"pass {sanitize_label(on_disk_run_id)}")
     return 0
 
 
@@ -340,10 +340,16 @@ def print_export_preview(preview: dict[str, object]) -> None:
         for file in files
         if file["status"] != "scanned"
         or cast(dict[str, object], file["findings"])["total"] != 0
+        or file.get("identity_verified") is False
     ]
     for file in noteworthy[:MAX_TEXT_FILE_ENTRIES]:
         reason = f" reason={file['reason']}" if "reason" in file else ""
-        lines.append(f"{file['status']} {file['path']}{reason}")
+        identity = (
+            " identity=unverified"
+            if file.get("identity_verified") is False
+            else ""
+        )
+        lines.append(f"{file['status']} {file['path']}{reason}{identity}")
     if len(noteworthy) > MAX_TEXT_FILE_ENTRIES:
         lines.append(
             f"additional noteworthy files={len(noteworthy) - MAX_TEXT_FILE_ENTRIES}"

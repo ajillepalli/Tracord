@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -84,7 +85,7 @@ def parse_assertion_case(data: bytes, case_name: str) -> TraceExpectations:
 
 
 def _read_assertion_file(path: Path) -> bytes:
-    absolute_path = path.absolute()
+    absolute_path = Path(os.path.abspath(path))
     filesystem_root = Path(absolute_path.anchor)
     try:
         relative_path = absolute_path.relative_to(filesystem_root).as_posix()

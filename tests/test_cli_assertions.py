@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+import sys
 from pathlib import Path
 
 import pytest
 
 from tracord import cli
 from tracord.assertions import AssertionFailure, TraceExpectations
+from tracord.recorder import record_command
 
 
 def test_assert_parser_accepts_repository_case_and_file() -> None:
@@ -32,6 +35,7 @@ def test_assert_parser_accepts_repository_case_and_file() -> None:
         ["assert", "run-1"],
         ["assert", "run-1", "--file", "checks.json"],
         ["assert", "run-1", "--case", "ci", "--status", "passed"],
+        ["assert", "run-1", "--case", "ci", "--exit-code", "0"],
         ["assert", "run-1", "--stdout-contains", ""],
         ["assert", "run-1", "--max-duration-ms", "-1"],
     ],
@@ -128,3 +132,57 @@ def test_assert_failure_output_uses_only_code_and_safe_location(
     assert captured.out == ""
     assert captured.err == "tracord: assert failed: assertion_mismatch at stdout_contains\n"
     assert secret not in captured.err
+
+
+def test_assert_file_mode_runs_end_to_end_with_parent_relative_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = tmp_path / "store"
+    trace = record_command(
+        [sys.executable, "-c", "print('ready')"],
+        root=store,
+    )
+    (store / "assertions.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "tracord.assertions.v0",
+                "cases": {
+                    "smoke": {
+                        "status": "passed",
+                        "stdout_contains": "ready",
+                        "no_timeout": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+
+    exit_code = cli.main(
+        [
+            "assert",
+            "--store",
+            "../store",
+            str(trace["run_id"]),
+            "--case",
+            "smoke",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == f"pass {trace['run_id']}\n"
+    assert captured.err == ""
+
+
+def test_assert_success_sanitizes_on_disk_run_id(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    unsafe = "run\u2028id"
+    monkeypatch.setattr(cli, "evaluate_run", lambda *_args: (unsafe, []))
+
+    assert cli.main(["assert", unsafe, "--status", "passed"]) == 0
+    assert capsys.readouterr().out == "pass run\\u2028id\n"

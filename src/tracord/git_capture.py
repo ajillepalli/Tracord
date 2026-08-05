@@ -268,15 +268,7 @@ class GitDiffCapture:
                 _git_message(read_tree, self.redact) or "git read-tree failed"
             )
 
-        add = _git(
-            self.repo_root,
-            ["add", "-A", "--", "."],
-            env=env,
-            timeout_seconds=self.git_timeout_seconds,
-        )
-        if add.returncode != 0:
-            raise ValueError(_git_message(add, self.redact) or "git add failed")
-
+        add_args = ["add", "-A", "--", "."]
         if self._exclude_path is not None:
             remove_store = _git(
                 self.repo_root,
@@ -297,6 +289,24 @@ class GitDiffCapture:
                     _git_message(remove_store, self.redact)
                     or "git runtime exclusion failed"
                 )
+            excludes_path = Path(self._temporary.name) / "runtime-excludes"
+            excludes_path.write_text(
+                f"/{_escape_gitignore_path(self._exclude_path)}/\n",
+                encoding="utf-8",
+            )
+            add_args = [
+                "-c",
+                f"core.excludesFile={excludes_path.as_posix()}",
+                *add_args,
+            ]
+        add = _git(
+            self.repo_root,
+            add_args,
+            env=env,
+            timeout_seconds=self.git_timeout_seconds,
+        )
+        if add.returncode != 0:
+            raise ValueError(_git_message(add, self.redact) or "git add failed")
 
         write_tree = _git(
             self.repo_root,
@@ -484,6 +494,13 @@ def _relative_store_path(repo_root: Path, store: Path) -> str | None:
         return store.relative_to(repo_root).as_posix() or "."
     except ValueError:
         return None
+
+
+def _escape_gitignore_path(value: str) -> str:
+    return "".join(
+        f"\\{character}" if character in r"\*?[]!# " else character
+        for character in value
+    )
 
 
 def _relative_cwd(repo_root: Path, cwd: Path) -> str:
