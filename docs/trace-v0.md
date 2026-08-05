@@ -31,6 +31,7 @@ The initial command recorder emits:
 
 - `command.started`
 - `command.finished`
+- `file.diff` when Git file-change capture is requested
 
 Future event types should be additive and should not require changing the top-level trace shape.
 
@@ -41,6 +42,16 @@ Artifact paths are relative to the directory containing `trace.json`. v0 command
 - `stdout.log`
 - `stderr.log`
 
+A trace with a captured Git patch also writes `changes.patch` and references it as `artifacts.file_diff`.
+
+## Optional File Changes
+
+When capture is requested, `file_changes` records a status, structured changed-file list, configured size limit, and optional patch metadata. Status is one of `captured`, `unchanged`, `skipped`, `omitted`, or `error`. The same object is emitted as the `file.diff` event data.
+
+This field is additive: traces recorded without `--capture-diff` do not contain it and remain valid `tracord.trace.v0` traces.
+
 ## Privacy
 
 Tracord defaults to redacting obvious secrets from command output before writing artifacts. Redaction is best effort and not a complete DLP system.
+
+Git patch capture is opt-in. By default, textual patches receive the same best-effort redaction and binary payloads are omitted. `--no-redact` stores raw text and binary patch data. See [file-diff-capture.md](file-diff-capture.md).

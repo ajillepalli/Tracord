@@ -24,6 +24,7 @@ The project is aimed at developers building coding agents, MCP tools, and other 
 The current MVP includes:
 
 - **Command recording** - wrap a local command and capture status, timing, stdout, stderr, and trace metadata.
+- **Git file-change capture** - opt in to an isolated before/after working-tree diff with structured file metadata.
 - **Trace contract** - `tracord.trace.v0`, documented in [docs/trace-v0.md](docs/trace-v0.md) with a JSON Schema in [schemas/trace-v0.schema.json](schemas/trace-v0.schema.json).
 - **Deterministic assertions** - check status, exit code, timeout behavior, duration, and artifact contents.
 - **Portable bundles** - export and import `.tracord.zip` bundles with path traversal protections.
@@ -54,6 +55,7 @@ python -m tracord.cli --version
 
 ```bash
 tracord record -- python -c "print('hello from tracord')"
+tracord record --capture-diff -- python agent.py
 tracord list
 tracord inspect <run-id>
 tracord assert <run-id> --status passed --stdout-contains tracord
@@ -63,6 +65,8 @@ tracord replay <run-id>
 ```
 
 Recorded runs are stored locally under `.tracord/runs/`. Exported bundles are zip archives with a `.tracord.zip` suffix.
+
+File diff capture is opt-in because patches may contain sensitive source and data. See [docs/file-diff-capture.md](docs/file-diff-capture.md) for scope, redaction behavior, and limits.
 
 ## Testing
 

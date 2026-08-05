@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .git_capture import DEFAULT_GIT_TIMEOUT_SECONDS, DEFAULT_MAX_DIFF_BYTES
 from .recorder import record_command
 from .schema import validate_trace
 from .storage import read_json, run_dir
@@ -17,6 +18,9 @@ def replay_run(
     name: str | None = None,
     timeout_seconds: float | None = None,
     redact: bool = True,
+    capture_diff: bool = False,
+    max_diff_bytes: int = DEFAULT_MAX_DIFF_BYTES,
+    git_timeout_seconds: float = DEFAULT_GIT_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
     trace_path = run_dir(root, run_id) / "trace.json"
     if not trace_path.exists():
@@ -35,7 +39,16 @@ def replay_run(
 
     replay_name = name if name is not None else f"replay of {run_id}"
     timeout = timeout_seconds if timeout_seconds is not None else _timeout(trace.get("timeout_seconds"))
-    return record_command(command, root=root, name=replay_name, timeout_seconds=timeout, redact=redact)
+    return record_command(
+        command,
+        root=root,
+        name=replay_name,
+        timeout_seconds=timeout,
+        redact=redact,
+        capture_diff=capture_diff,
+        max_diff_bytes=max_diff_bytes,
+        git_timeout_seconds=git_timeout_seconds,
+    )
 
 
 def _timeout(value: object) -> float | None:

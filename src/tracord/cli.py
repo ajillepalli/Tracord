@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
 from . import __version__
 from .assertions import TraceExpectations, evaluate_trace
 from .bundle import export_run, import_bundle
+from .git_capture import DEFAULT_GIT_TIMEOUT_SECONDS, DEFAULT_MAX_DIFF_BYTES
 from .recorder import record_command
 from .replay import replay_run
 from .storage import DEFAULT_HOME, list_runs, read_json, run_dir
@@ -32,6 +34,19 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--name", help="human-readable run name")
     record.add_argument("--timeout", type=float, help="timeout in seconds")
     record.add_argument("--no-redact", action="store_true", help="store raw stdout and stderr")
+    record.add_argument("--capture-diff", action="store_true", help="capture Git file changes")
+    record.add_argument(
+        "--max-diff-bytes",
+        type=positive_int,
+        default=DEFAULT_MAX_DIFF_BYTES,
+        help="maximum patch artifact size",
+    )
+    record.add_argument(
+        "--git-timeout",
+        type=positive_float,
+        default=DEFAULT_GIT_TIMEOUT_SECONDS,
+        help="timeout in seconds for each Git capture operation",
+    )
     record.add_argument("command", nargs=argparse.REMAINDER, help="command to run after --")
     record.set_defaults(handler=handle_record)
 
@@ -73,6 +88,19 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--name", help="human-readable replay name")
     replay.add_argument("--timeout", type=float, help="override timeout in seconds")
     replay.add_argument("--no-redact", action="store_true", help="store raw stdout and stderr")
+    replay.add_argument("--capture-diff", action="store_true", help="capture new Git file changes")
+    replay.add_argument(
+        "--max-diff-bytes",
+        type=positive_int,
+        default=DEFAULT_MAX_DIFF_BYTES,
+        help="maximum patch artifact size",
+    )
+    replay.add_argument(
+        "--git-timeout",
+        type=positive_float,
+        default=DEFAULT_GIT_TIMEOUT_SECONDS,
+        help="timeout in seconds for each Git capture operation",
+    )
     replay.add_argument("run_id", help="run id to replay")
     replay.set_defaults(handler=handle_replay)
 
@@ -91,6 +119,9 @@ def handle_record(args: argparse.Namespace) -> int:
         name=args.name,
         timeout_seconds=args.timeout,
         redact=not args.no_redact,
+        capture_diff=args.capture_diff,
+        max_diff_bytes=args.max_diff_bytes,
+        git_timeout_seconds=args.git_timeout,
     )
     print_record_result(Path(args.store), trace)
     return 0 if trace["status"] == "passed" else 1
@@ -176,6 +207,9 @@ def handle_replay(args: argparse.Namespace) -> int:
             name=args.name,
             timeout_seconds=args.timeout,
             redact=not args.no_redact,
+            capture_diff=args.capture_diff,
+            max_diff_bytes=args.max_diff_bytes,
+            git_timeout_seconds=args.git_timeout,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"tracord: {exc}", file=sys.stderr)
@@ -187,12 +221,30 @@ def handle_replay(args: argparse.Namespace) -> int:
 def print_record_result(store: Path, trace: dict[str, object]) -> None:
     print(f"{trace['status']} {trace['run_id']} {trace['duration_ms']}ms")
     print(f"trace: {run_dir(store, str(trace['run_id'])) / 'trace.json'}")
+    file_changes = trace.get("file_changes")
+    if isinstance(file_changes, dict):
+        changed_files = file_changes.get("changed_files", 0)
+        print(f"file diff: {file_changes.get('status')} files={changed_files}")
 
 
 def strip_separator(command: list[str]) -> list[str]:
     if command and command[0] == "--":
         return command[1:]
     return command
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than zero")
+    return parsed
 
 
 if __name__ == "__main__":

@@ -90,9 +90,12 @@ def import_bundle(
             raise ValueError("bundle is missing expected files: " + ", ".join(missing))
 
         run_id = str(trace["run_id"])
+        _validate_run_id(run_id)
         target_dir = run_dir(root, run_id)
         if target_dir.exists() and not overwrite:
             raise FileExistsError(f"run already exists: {run_id}")
+        if target_dir.exists():
+            _remove_stale_artifacts(target_dir, expected_files, member_names)
         target_dir.mkdir(parents=True, exist_ok=True)
 
         for file_name in sorted(expected_files):
@@ -105,6 +108,29 @@ def import_bundle(
 
     return trace
 
+
+def _validate_run_id(run_id: str) -> None:
+    errors = validate_relative_path(run_id)
+    if errors or "/" in run_id:
+        raise ValueError("invalid run id: " + "; ".join(errors or ["must be one path segment"]))
+
+
+def _remove_stale_artifacts(
+    target_dir: Path,
+    expected_files: set[str],
+    member_names: list[str],
+) -> None:
+    existing_trace_path = target_dir / TRACE_FILE
+    if existing_trace_path.exists():
+        try:
+            existing_trace = read_json(existing_trace_path)
+            stale_artifacts = set(_artifact_names(existing_trace)).difference(expected_files)
+        except (OSError, ValueError):
+            stale_artifacts = set()
+        for file_name in stale_artifacts:
+            safe_join(target_dir, file_name).unlink(missing_ok=True)
+    if MANIFEST_FILE not in member_names:
+        (target_dir / "bundle-manifest.json").unlink(missing_ok=True)
 
 def _artifact_names(trace: dict[str, Any]) -> list[str]:
     artifacts = trace.get("artifacts")

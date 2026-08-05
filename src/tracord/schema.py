@@ -8,6 +8,7 @@ from typing import Any
 
 SCHEMA_VERSION = "tracord.trace.v0"
 STATUSES = {"passed", "failed", "timeout"}
+FILE_CHANGE_STATUSES = {"captured", "unchanged", "skipped", "omitted", "error"}
 REQUIRED_FIELDS = (
     "schema_version",
     "run_id",
@@ -86,6 +87,9 @@ def validate_trace(trace: Mapping[str, Any]) -> list[str]:
             if not isinstance(event.get("data"), Mapping):
                 errors.append(f"events[{index}].data must be an object")
 
+    if "file_changes" in trace:
+        _validate_file_changes(trace.get("file_changes"), artifacts, errors)
+
     return errors
 
 
@@ -93,3 +97,46 @@ def _is_non_empty_string_sequence(value: object) -> bool:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return False
     return bool(value) and all(isinstance(item, str) for item in value)
+
+
+def _validate_file_changes(
+    value: object,
+    artifacts: object,
+    errors: list[str],
+) -> None:
+    if not isinstance(value, Mapping):
+        errors.append("file_changes must be an object")
+        return
+
+    status = value.get("status")
+    if status not in FILE_CHANGE_STATUSES:
+        errors.append(
+            "file_changes.status must be one of: captured, error, omitted, skipped, unchanged"
+        )
+
+    changed_files = value.get("changed_files")
+    if changed_files is not None and (
+        not isinstance(changed_files, int) or isinstance(changed_files, bool) or changed_files < 0
+    ):
+        errors.append("file_changes.changed_files must be a non-negative integer")
+
+    files = value.get("files")
+    if files is not None:
+        if not isinstance(files, list):
+            errors.append("file_changes.files must be a list")
+        else:
+            for index, change in enumerate(files):
+                if not isinstance(change, Mapping):
+                    errors.append(f"file_changes.files[{index}] must be an object")
+                    continue
+                if not isinstance(change.get("status"), str) or not change.get("status"):
+                    errors.append(f"file_changes.files[{index}].status must be a non-empty string")
+                if not isinstance(change.get("path"), str) or not change.get("path"):
+                    errors.append(f"file_changes.files[{index}].path must be a non-empty string")
+
+    artifact = value.get("artifact")
+    if status == "captured":
+        if not isinstance(artifact, str) or not artifact:
+            errors.append("captured file_changes must name an artifact")
+        elif not isinstance(artifacts, Mapping) or artifacts.get("file_diff") != artifact:
+            errors.append("artifacts.file_diff must match file_changes.artifact")

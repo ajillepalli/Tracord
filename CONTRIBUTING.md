@@ -82,6 +82,7 @@ src/tracord/              # CLI and core recording code
   replay.py               # command replay
   redaction.py            # best-effort output redaction
   paths.py                # safe relative path handling
+  git_capture.py          # isolated Git before/after snapshots
 tests/                    # unit tests
 docs/                     # architecture, roadmap, trace and bundle docs
 schemas/                  # machine-readable trace schemas
