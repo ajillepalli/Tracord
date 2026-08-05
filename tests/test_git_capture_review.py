@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import zipfile
@@ -153,6 +154,28 @@ def test_capture_preserves_configured_global_ignores(tmp_path: Path, monkeypatch
     ).read_text(encoding="utf-8")
     assert "private.pem" not in patch
     assert "after-secret" not in patch
+
+
+@pytest.mark.skipif(os.name == "nt", reason="wildcards are not legal Windows filenames")
+def test_discovered_paths_are_literal_when_added(tmp_path: Path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    monkeypatch.chdir(repo)
+
+    trace = record_command(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('*.log').write_text('literal')",
+        ],
+        root=repo / ".tracord",
+        capture_diff=True,
+    )
+
+    assert trace["file_changes"]["files"] == [{"status": "A", "path": "*.log"}]
+    patch = (
+        run_dir(repo / ".tracord", str(trace["run_id"])) / "changes.patch"
+    ).read_text(encoding="utf-8")
+    assert ".tracord/runs/" not in patch
 
 
 def test_capture_excludes_only_the_active_store_runtime(tmp_path: Path, monkeypatch):

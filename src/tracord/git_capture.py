@@ -323,6 +323,7 @@ class GitDiffCapture:
             add = _git(
                 self.repo_root,
                 [
+                    "--literal-pathspecs",
                     "add",
                     "-A",
                     f"--pathspec-from-file={pathspec_path.as_posix()}",
