@@ -122,8 +122,11 @@ def _remove_stale_artifacts(
 ) -> None:
     existing_trace_path = target_dir / TRACE_FILE
     if existing_trace_path.exists():
-        existing_trace = read_json(existing_trace_path)
-        stale_artifacts = set(_artifact_names(existing_trace)).difference(expected_files)
+        try:
+            existing_trace = read_json(existing_trace_path)
+            stale_artifacts = set(_artifact_names(existing_trace)).difference(expected_files)
+        except (OSError, ValueError):
+            stale_artifacts = set()
         for file_name in stale_artifacts:
             safe_join(target_dir, file_name).unlink(missing_ok=True)
     if MANIFEST_FILE not in member_names:

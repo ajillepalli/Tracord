@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import tempfile
@@ -22,7 +23,14 @@ _GIT_CONTEXT_VARIABLES = {
     "GIT_COMMON_DIR",
     "GIT_DIR",
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
     "GIT_INDEX_FILE",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
     "GIT_OBJECT_DIRECTORY",
     "GIT_PREFIX",
     "GIT_WORK_TREE",
@@ -53,7 +61,7 @@ class GitDiffCapture:
     ) -> None:
         if max_diff_bytes <= 0:
             raise ValueError("max_diff_bytes must be greater than zero")
-        if git_timeout_seconds <= 0:
+        if not math.isfinite(git_timeout_seconds) or git_timeout_seconds <= 0:
             raise ValueError("git_timeout_seconds must be greater than zero")
 
         self.cwd = cwd.resolve()
