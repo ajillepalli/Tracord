@@ -19,6 +19,14 @@ STDOUT_ARTIFACT = "stdout.log"
 STDERR_ARTIFACT = "stderr.log"
 
 
+class RecordError(ValueError):
+    """A fixed-code, path-free recording failure."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
