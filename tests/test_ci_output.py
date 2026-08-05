@@ -183,15 +183,20 @@ def test_assertion_result_rejects_crossed_outcome_or_unsafe_location():
             error_code="assertion_file_schema_invalid",
             error_location="cases.secret\npath",
         )
-    with pytest.raises(CIOutputError):
-        build_assertion_result(
-            exit_code=0,
-            outcome="pass",
-            run_id=None,
-            source="inline",
-            case=None,
-            failures=[],
-        )
+
+
+def test_assertion_result_can_hide_a_non_ci_safe_operational_id():
+    result = build_assertion_result(
+        exit_code=0,
+        outcome="pass",
+        run_id=None,
+        source="inline",
+        case=None,
+        failures=[],
+    )
+
+    assert result["run_id"] is None
+    assert result["outcome"] == "pass"
 
 
 def test_list_result_bounds_counts_and_projects_runs():

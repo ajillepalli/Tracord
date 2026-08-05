@@ -197,8 +197,6 @@ def build_assertion_result(
         raise CIOutputError("inconsistent assertion exit code")
     if outcome in {"mismatch", "indeterminate"} and exit_code != 1:
         raise CIOutputError("inconsistent assertion exit code")
-    if outcome != "error" and run_id is None:
-        raise CIOutputError("assertion outcome without run id")
     return {
         "result_version": ASSERTION_RESULT_VERSION,
         "command": COMMAND_ASSERT,

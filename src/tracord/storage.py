@@ -86,7 +86,10 @@ def prepare_store_for_read(root: Path) -> PreparedStore | None:
     _validate_directory(root, root_snapshot)
 
     root_final = _directory_snapshot(root)
-    if compare_identity(root_snapshot, root_final) is not IdentityComparison.VERIFIED:
+    root_identity = compare_identity(root_snapshot, root_final)
+    if root_identity is IdentityComparison.DIFFERENT:
+        raise StoreSafetyError("changed")
+    if root_identity is IdentityComparison.UNAVAILABLE:
         raise StoreSafetyError("identity_unverifiable")
 
     runs = root / RUNS_DIR
@@ -102,12 +105,11 @@ def prepare_store_for_read(root: Path) -> PreparedStore | None:
 
     root_final = _directory_snapshot(root)
     runs_final = _directory_snapshot(runs)
-    if (
-        compare_identity(root_snapshot, root_final)
-        is not IdentityComparison.VERIFIED
-        or compare_identity(runs_snapshot, runs_final)
-        is not IdentityComparison.VERIFIED
-    ):
+    root_identity = compare_identity(root_snapshot, root_final)
+    runs_identity = compare_identity(runs_snapshot, runs_final)
+    if IdentityComparison.DIFFERENT in {root_identity, runs_identity}:
+        raise StoreSafetyError("changed")
+    if IdentityComparison.UNAVAILABLE in {root_identity, runs_identity}:
         raise StoreSafetyError("identity_unverifiable")
 
     return PreparedStore(

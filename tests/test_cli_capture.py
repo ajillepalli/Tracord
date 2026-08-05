@@ -1,5 +1,6 @@
 import argparse
 import os
+import site
 import subprocess
 import sys
 import sysconfig
@@ -82,18 +83,20 @@ def test_process_entrypoints_suppress_broken_pipe_diagnostics(
 ):
     read_fd, write_fd = os.pipe()
     os.close(read_fd)
+    console_path = Path(sysconfig.get_path("scripts")) / (
+        "tracord.exe" if os.name == "nt" else "tracord"
+    )
+    if not console_path.exists():
+        console_path = (
+            Path(site.getuserbase())
+            / f"Python{sys.version_info.major}{sys.version_info.minor}"
+            / "Scripts"
+            / ("tracord.exe" if os.name == "nt" else "tracord")
+        )
     command = (
         [sys.executable, "-m", "tracord", "--version"]
         if entrypoint == "module"
-        else [
-            str(
-                Path(sysconfig.get_path("scripts"))
-                / (
-                    "tracord.exe" if os.name == "nt" else "tracord"
-                )
-            ),
-            "--version",
-        ]
+        else [str(console_path), "--version"]
     )
     try:
         completed = subprocess.run(
