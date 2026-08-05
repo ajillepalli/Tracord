@@ -135,6 +135,10 @@
           "type": "integer",
           "minimum": 1
         },
+        "git_timeout_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
         "bytes": {
           "type": "integer",
           "minimum": 0

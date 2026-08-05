@@ -9,7 +9,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .git_capture import DEFAULT_MAX_DIFF_BYTES, GitDiffCapture
+from .git_capture import DEFAULT_GIT_TIMEOUT_SECONDS, DEFAULT_MAX_DIFF_BYTES, GitDiffCapture
 from .redaction import redact_text
 from .schema import SCHEMA_VERSION
 from .storage import ensure_store, run_dir, write_json
@@ -38,6 +38,7 @@ def record_command(
     redact: bool = True,
     capture_diff: bool = False,
     max_diff_bytes: int = DEFAULT_MAX_DIFF_BYTES,
+    git_timeout_seconds: float = DEFAULT_GIT_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
     if not command:
         raise ValueError("command must not be empty")
@@ -56,6 +57,7 @@ def record_command(
             store=root,
             max_diff_bytes=max_diff_bytes,
             redact=redact,
+            git_timeout_seconds=git_timeout_seconds,
         )
         diff_capture.start()
 
@@ -101,8 +103,8 @@ def record_command(
 
     stored_stdout = redact_text(stdout) if redact else stdout
     stored_stderr = redact_text(stderr) if redact else stderr
-    (output_dir / STDOUT_ARTIFACT).write_text(stored_stdout, encoding="utf-8")
-    (output_dir / STDERR_ARTIFACT).write_text(stored_stderr, encoding="utf-8")
+    (output_dir / STDOUT_ARTIFACT).write_bytes(stored_stdout.encode("utf-8"))
+    (output_dir / STDERR_ARTIFACT).write_bytes(stored_stderr.encode("utf-8"))
 
     if timed_out:
         status = "timeout"

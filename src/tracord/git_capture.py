@@ -6,15 +6,37 @@ import os
 import subprocess
 import tempfile
 import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from .redaction import redact_text
 
 
 FILE_DIFF_ARTIFACT = "changes.patch"
 DEFAULT_MAX_DIFF_BYTES = 10 * 1024 * 1024
-_GIT_TIMEOUT_SECONDS = 30
+DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
+_MAX_SUMMARY_BYTES = 4 * 1024 * 1024
+_GIT_CONTEXT_VARIABLES = {
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_WORK_TREE",
+}
+
+
+@dataclass(frozen=True)
+class _LimitedGitResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool
+    exceeded_limit: bool
+    observed_bytes: int
 
 
 class GitDiffCapture:
@@ -27,16 +49,21 @@ class GitDiffCapture:
         store: Path,
         max_diff_bytes: int,
         redact: bool,
+        git_timeout_seconds: float = DEFAULT_GIT_TIMEOUT_SECONDS,
     ) -> None:
         if max_diff_bytes <= 0:
             raise ValueError("max_diff_bytes must be greater than zero")
+        if git_timeout_seconds <= 0:
+            raise ValueError("git_timeout_seconds must be greater than zero")
 
         self.cwd = cwd.resolve()
         self.store = store.resolve()
         self.max_diff_bytes = max_diff_bytes
+        self.git_timeout_seconds = git_timeout_seconds
         self.redact = redact
         self.repo_root: Path | None = None
         self.before_tree: str | None = None
+        self._base_git_env = _sanitized_git_env()
         self._temporary: tempfile.TemporaryDirectory[str] | None = None
         self._git_env: dict[str, str] | None = None
         self._exclude_path: str | None = None
@@ -44,7 +71,12 @@ class GitDiffCapture:
 
     def start(self) -> None:
         try:
-            discovered = _git(self.cwd, ["rev-parse", "--show-toplevel"])
+            discovered = _git(
+                self.cwd,
+                ["rev-parse", "--show-toplevel"],
+                env=self._base_git_env,
+                timeout_seconds=self.git_timeout_seconds,
+            )
         except FileNotFoundError:
             self._initial_result = _result("skipped", reason="git_unavailable")
             return
@@ -63,36 +95,59 @@ class GitDiffCapture:
         self.repo_root = Path(repo_text).resolve()
 
         try:
-            common_dir_result = _git(self.repo_root, ["rev-parse", "--git-common-dir"])
+            common_dir_result = _git(
+                self.repo_root,
+                ["rev-parse", "--git-common-dir"],
+                env=self._base_git_env,
+                timeout_seconds=self.git_timeout_seconds,
+            )
             if common_dir_result.returncode != 0:
-                self._initial_result = _git_error("git_common_dir_failed", common_dir_result, self.redact)
+                self._initial_result = _git_error(
+                    "git_common_dir_failed", common_dir_result, self.redact
+                )
                 return
-            common_dir_text = common_dir_result.stdout.decode("utf-8", errors="replace").strip()
+            common_dir_text = common_dir_result.stdout.decode(
+                "utf-8", errors="replace"
+            ).strip()
             common_dir = Path(common_dir_text)
             if not common_dir.is_absolute():
                 common_dir = self.repo_root / common_dir
             real_objects = common_dir.resolve() / "objects"
 
-            self._temporary = tempfile.TemporaryDirectory(prefix="tracord-git-")
+            self._temporary = tempfile.TemporaryDirectory(
+                prefix="tracord-git-",
+                ignore_cleanup_errors=True,
+            )
             temporary_root = Path(self._temporary.name)
             temporary_objects = temporary_root / "objects"
             temporary_objects.mkdir()
-            self._git_env = os.environ.copy()
+
+            alternates = [str(real_objects)]
+            inherited_alternates = self._base_git_env.get(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+            )
+            if inherited_alternates:
+                alternates.append(inherited_alternates)
+            self._git_env = self._base_git_env.copy()
             self._git_env.update(
                 {
-                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(real_objects),
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": os.pathsep.join(alternates),
                     "GIT_OBJECT_DIRECTORY": str(temporary_objects),
                     "GIT_OPTIONAL_LOCKS": "0",
                 }
             )
             self._exclude_path = _relative_store_path(self.repo_root, self.store)
             if self._exclude_path == ".":
-                self._initial_result = _result("error", reason="store_contains_repository")
+                self._initial_result = _result(
+                    "error", reason="store_contains_repository"
+                )
                 self.close()
                 return
             self.before_tree = self._snapshot("before")
         except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
-            self._initial_result = _error_result("before_snapshot_failed", exc, self.redact)
+            self._initial_result = _error_result(
+                "before_snapshot_failed", exc, self.redact
+            )
             self.close()
 
     def finish(self, output_dir: Path) -> dict[str, Any]:
@@ -103,7 +158,7 @@ class GitDiffCapture:
 
         try:
             after_tree = self._snapshot("after")
-            summary_result = _git(
+            summary_result = _git_limited(
                 self.repo_root,
                 [
                     "diff",
@@ -117,22 +172,44 @@ class GitDiffCapture:
                     "--",
                 ],
                 env=self._git_env,
+                timeout_seconds=self.git_timeout_seconds,
+                max_bytes=_MAX_SUMMARY_BYTES,
             )
+            if summary_result.timed_out:
+                return _result("error", reason="diff_summary_timeout")
+            if summary_result.exceeded_limit:
+                return _result(
+                    "omitted",
+                    reason="summary_size_limit",
+                    max_summary_bytes=_MAX_SUMMARY_BYTES,
+                    observed_bytes_at_least=summary_result.observed_bytes,
+                    max_diff_bytes=self.max_diff_bytes,
+                    repository_relative_cwd=_relative_cwd(
+                        self.repo_root, self.cwd
+                    ),
+                )
             if summary_result.returncode != 0:
-                return _git_error("diff_summary_failed", summary_result, self.redact)
+                return _git_error(
+                    "diff_summary_failed", summary_result, self.redact
+                )
 
             files = _parse_name_status(summary_result.stdout)
             base = {
                 "changed_files": len(files),
                 "files": files,
                 "max_diff_bytes": self.max_diff_bytes,
-                "repository_relative_cwd": _relative_cwd(self.repo_root, self.cwd),
+                "git_timeout_seconds": self.git_timeout_seconds,
+                "repository_relative_cwd": _relative_cwd(
+                    self.repo_root, self.cwd
+                ),
             }
             if not files:
                 return _result("unchanged", **base)
 
             artifact_path = output_dir / FILE_DIFF_ARTIFACT
-            patch_result = self._write_patch(self.before_tree, after_tree, artifact_path)
+            patch_result = self._write_patch(
+                self.before_tree, after_tree, artifact_path
+            )
             return {**base, **patch_result}
         except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
             return _error_result("after_snapshot_failed", exc, self.redact)
@@ -141,8 +218,12 @@ class GitDiffCapture:
 
     def close(self) -> None:
         if self._temporary is not None:
-            self._temporary.cleanup()
+            temporary = self._temporary
             self._temporary = None
+            try:
+                temporary.cleanup()
+            except OSError:
+                pass
         self._git_env = None
 
     def _snapshot(self, label: str) -> str:
@@ -151,41 +232,65 @@ class GitDiffCapture:
 
         index_path = Path(self._temporary.name) / f"index-{label}"
         env = {**self._git_env, "GIT_INDEX_FILE": str(index_path)}
-        head = _git(self.repo_root, ["rev-parse", "--verify", "HEAD^{tree}"], env=env)
-        read_tree_args = ["read-tree", "HEAD"] if head.returncode == 0 else ["read-tree", "--empty"]
-        read_tree = _git(self.repo_root, read_tree_args, env=env)
+        head = _git(
+            self.repo_root,
+            ["rev-parse", "--verify", "HEAD^{tree}"],
+            env=env,
+            timeout_seconds=self.git_timeout_seconds,
+        )
+        read_tree_args = (
+            ["read-tree", "HEAD"]
+            if head.returncode == 0
+            else ["read-tree", "--empty"]
+        )
+        read_tree = _git(
+            self.repo_root,
+            read_tree_args,
+            env=env,
+            timeout_seconds=self.git_timeout_seconds,
+        )
         if read_tree.returncode != 0:
-            raise ValueError(_git_message(read_tree, self.redact) or "git read-tree failed")
+            raise ValueError(
+                _git_message(read_tree, self.redact) or "git read-tree failed"
+            )
 
         pathspecs = ["."]
         if self._exclude_path is not None:
-            pathspecs.extend(
-                [
-                    f":(top,exclude){self._exclude_path}",
-                    f":(top,exclude){self._exclude_path}/**",
-                ]
-            )
-        add = _git(self.repo_root, ["add", "-A", "--", *pathspecs], env=env)
+            pathspecs.append(f":(top,literal,exclude){self._exclude_path}")
+        add = _git(
+            self.repo_root,
+            ["add", "-A", "--", *pathspecs],
+            env=env,
+            timeout_seconds=self.git_timeout_seconds,
+        )
         if add.returncode != 0:
             raise ValueError(_git_message(add, self.redact) or "git add failed")
 
-        write_tree = _git(self.repo_root, ["write-tree"], env=env)
+        write_tree = _git(
+            self.repo_root,
+            ["write-tree"],
+            env=env,
+            timeout_seconds=self.git_timeout_seconds,
+        )
         if write_tree.returncode != 0:
-            raise ValueError(_git_message(write_tree, self.redact) or "git write-tree failed")
+            raise ValueError(
+                _git_message(write_tree, self.redact) or "git write-tree failed"
+            )
         tree = write_tree.stdout.decode("ascii", errors="replace").strip()
         if not tree:
             raise ValueError("git write-tree returned no tree")
         return tree
 
-    def _write_patch(self, before_tree: str, after_tree: str, artifact_path: Path) -> dict[str, Any]:
+    def _write_patch(
+        self,
+        before_tree: str,
+        after_tree: str,
+        artifact_path: Path,
+    ) -> dict[str, Any]:
         if self.repo_root is None or self._git_env is None:
             return _result("error", reason="capture_not_started")
 
         args = [
-            "git",
-            "--no-optional-locks",
-            "-C",
-            str(self.repo_root),
             "diff",
             "--no-ext-diff",
             "--no-textconv",
@@ -196,66 +301,45 @@ class GitDiffCapture:
         args.extend([before_tree, after_tree, "--"])
 
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        total_bytes = 0
-        with tempfile.TemporaryFile() as error_file:
-            process = subprocess.Popen(
-                args,
-                cwd=self.repo_root,
-                env=self._git_env,
-                stdout=subprocess.PIPE,
-                stderr=error_file,
-            )
-            timed_out = threading.Event()
-
-            def stop_on_timeout() -> None:
-                timed_out.set()
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-
-            timer = threading.Timer(_GIT_TIMEOUT_SECONDS, stop_on_timeout)
-            timer.daemon = True
-            timer.start()
-            assert process.stdout is not None
-            try:
-                with artifact_path.open("wb") as patch_file:
-                    while chunk := process.stdout.read(64 * 1024):
-                        total_bytes += len(chunk)
-                        if total_bytes > self.max_diff_bytes:
-                            try:
-                                process.kill()
-                            except OSError:
-                                pass
-                            break
-                        patch_file.write(chunk)
-                return_code = process.wait()
-            finally:
-                timer.cancel()
-            error_file.seek(0)
-            error_output = error_file.read()
-
-        if timed_out.is_set():
+        patch_result = _git_limited(
+            self.repo_root,
+            args,
+            env=self._git_env,
+            timeout_seconds=self.git_timeout_seconds,
+            max_bytes=self.max_diff_bytes,
+            output_path=artifact_path,
+        )
+        if patch_result.timed_out:
             artifact_path.unlink(missing_ok=True)
             return _result("error", reason="diff_generation_timeout")
-        if total_bytes > self.max_diff_bytes:
+        if patch_result.exceeded_limit:
             artifact_path.unlink(missing_ok=True)
             return _result(
                 "omitted",
                 reason="size_limit",
-                observed_bytes_at_least=total_bytes,
+                observed_bytes_at_least=patch_result.observed_bytes,
             )
-        if return_code != 0:
+        if patch_result.returncode != 0:
             artifact_path.unlink(missing_ok=True)
-            detail = _safe_detail(error_output, self.redact)
-            return _result("error", reason="diff_generation_failed", detail=detail)
+            return _result(
+                "error",
+                reason="diff_generation_failed",
+                detail=_safe_detail(patch_result.stderr, self.redact),
+            )
 
         if self.redact:
-            patch_text = artifact_path.read_text(encoding="utf-8", errors="replace")
-            artifact_path.write_text(redact_text(patch_text), encoding="utf-8")
+            patch_text = artifact_path.read_bytes().decode(
+                "utf-8", errors="surrogateescape"
+            )
+            redacted_patch = redact_text(patch_text).encode(
+                "utf-8", errors="surrogateescape"
+            )
+            artifact_path.write_bytes(redacted_patch)
             if artifact_path.stat().st_size > self.max_diff_bytes:
                 artifact_path.unlink(missing_ok=True)
-                return _result("omitted", reason="size_limit_after_redaction")
+                return _result(
+                    "omitted", reason="size_limit_after_redaction"
+                )
 
         return _result(
             "captured",
@@ -266,18 +350,100 @@ class GitDiffCapture:
         )
 
 
+def _sanitized_git_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in _GIT_CONTEXT_VARIABLES
+    }
+
+
 def _git(
     cwd: Path,
     args: list[str],
     *,
-    env: dict[str, str] | None = None,
+    env: dict[str, str],
+    timeout_seconds: float,
 ) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         ["git", "--no-optional-locks", "-C", str(cwd), *args],
         capture_output=True,
         check=False,
         env=env,
-        timeout=_GIT_TIMEOUT_SECONDS,
+        timeout=timeout_seconds,
+    )
+
+
+def _git_limited(
+    cwd: Path,
+    args: list[str],
+    *,
+    env: dict[str, str],
+    timeout_seconds: float,
+    max_bytes: int,
+    output_path: Path | None = None,
+) -> _LimitedGitResult:
+    output = bytearray()
+    output_file: BinaryIO | None = None
+    observed_bytes = 0
+    exceeded_limit = False
+    timed_out = threading.Event()
+
+    if output_path is not None:
+        output_file = output_path.open("wb")
+    try:
+        with tempfile.TemporaryFile() as error_file:
+            with subprocess.Popen(
+                ["git", "--no-optional-locks", "-C", str(cwd), *args],
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=error_file,
+            ) as process:
+
+                def stop_on_timeout() -> None:
+                    if process.poll() is None:
+                        timed_out.set()
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+
+                timer = threading.Timer(timeout_seconds, stop_on_timeout)
+                timer.daemon = True
+                timer.start()
+                if process.stdout is None:
+                    raise RuntimeError("git stdout pipe is unavailable")
+                try:
+                    while chunk := process.stdout.read(64 * 1024):
+                        observed_bytes += len(chunk)
+                        if observed_bytes > max_bytes:
+                            exceeded_limit = True
+                            try:
+                                process.kill()
+                            except OSError:
+                                pass
+                            break
+                        if output_file is None:
+                            output.extend(chunk)
+                        else:
+                            output_file.write(chunk)
+                    return_code = process.wait()
+                finally:
+                    timer.cancel()
+            error_file.seek(0)
+            error_output = error_file.read()
+    finally:
+        if output_file is not None:
+            output_file.close()
+
+    return _LimitedGitResult(
+        returncode=return_code,
+        stdout=bytes(output),
+        stderr=error_output,
+        timed_out=timed_out.is_set() and return_code != 0,
+        exceeded_limit=exceeded_limit,
+        observed_bytes=observed_bytes,
     )
 
 
@@ -314,7 +480,9 @@ def _parse_name_status(output: bytes) -> list[dict[str, str]]:
             old_path = fields[index]
             path = fields[index + 1]
             index += 2
-            changes.append({"status": status, "old_path": old_path, "path": path})
+            changes.append(
+                {"status": status, "old_path": old_path, "path": path}
+            )
         else:
             path = fields[index]
             index += 1
@@ -323,18 +491,34 @@ def _parse_name_status(output: bytes) -> list[dict[str, str]]:
 
 
 def _result(status: str, **values: Any) -> dict[str, Any]:
-    return {"status": status, **{key: value for key, value in values.items() if value != ""}}
+    return {
+        "status": status,
+        **{key: value for key, value in values.items() if value != ""},
+    }
 
 
-def _git_error(reason: str, result: subprocess.CompletedProcess[bytes], redact: bool) -> dict[str, Any]:
+def _git_error(
+    reason: str,
+    result: subprocess.CompletedProcess[bytes] | _LimitedGitResult,
+    redact: bool,
+) -> dict[str, Any]:
     return _result("error", reason=reason, detail=_git_message(result, redact))
 
 
-def _error_result(reason: str, exc: BaseException, redact: bool) -> dict[str, Any]:
-    return _result("error", reason=reason, detail=_safe_detail(str(exc).encode(), redact))
+def _error_result(
+    reason: str,
+    exc: BaseException,
+    redact: bool,
+) -> dict[str, Any]:
+    return _result(
+        "error", reason=reason, detail=_safe_detail(str(exc).encode(), redact)
+    )
 
 
-def _git_message(result: subprocess.CompletedProcess[bytes], redact: bool) -> str:
+def _git_message(
+    result: subprocess.CompletedProcess[bytes] | _LimitedGitResult,
+    redact: bool,
+) -> str:
     return _safe_detail(result.stderr or result.stdout, redact)
 
 

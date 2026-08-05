@@ -10,7 +10,7 @@ from pathlib import Path
 from . import __version__
 from .assertions import TraceExpectations, evaluate_trace
 from .bundle import export_run, import_bundle
-from .git_capture import DEFAULT_MAX_DIFF_BYTES
+from .git_capture import DEFAULT_GIT_TIMEOUT_SECONDS, DEFAULT_MAX_DIFF_BYTES
 from .recorder import record_command
 from .replay import replay_run
 from .storage import DEFAULT_HOME, list_runs, read_json, run_dir
@@ -39,6 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=DEFAULT_MAX_DIFF_BYTES,
         help="maximum patch artifact size",
+    )
+    record.add_argument(
+        "--git-timeout",
+        type=positive_float,
+        default=DEFAULT_GIT_TIMEOUT_SECONDS,
+        help="timeout in seconds for each Git capture operation",
     )
     record.add_argument("command", nargs=argparse.REMAINDER, help="command to run after --")
     record.set_defaults(handler=handle_record)
@@ -88,6 +94,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_DIFF_BYTES,
         help="maximum patch artifact size",
     )
+    replay.add_argument(
+        "--git-timeout",
+        type=positive_float,
+        default=DEFAULT_GIT_TIMEOUT_SECONDS,
+        help="timeout in seconds for each Git capture operation",
+    )
     replay.add_argument("run_id", help="run id to replay")
     replay.set_defaults(handler=handle_replay)
 
@@ -108,6 +120,7 @@ def handle_record(args: argparse.Namespace) -> int:
         redact=not args.no_redact,
         capture_diff=args.capture_diff,
         max_diff_bytes=args.max_diff_bytes,
+        git_timeout_seconds=args.git_timeout,
     )
     print_record_result(Path(args.store), trace)
     return 0 if trace["status"] == "passed" else 1
@@ -195,6 +208,7 @@ def handle_replay(args: argparse.Namespace) -> int:
             redact=not args.no_redact,
             capture_diff=args.capture_diff,
             max_diff_bytes=args.max_diff_bytes,
+            git_timeout_seconds=args.git_timeout,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"tracord: {exc}", file=sys.stderr)
@@ -220,6 +234,13 @@ def strip_separator(command: list[str]) -> list[str]:
 
 def positive_int(value: str) -> int:
     parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
     return parsed

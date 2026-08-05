@@ -43,4 +43,8 @@ Default capture applies Tracord best-effort secret redaction to textual patches 
 
 The default patch limit is 10 MiB. Set a smaller or larger positive limit with `--max-diff-bytes`. Oversized patches are deleted, while the structured changed-file summary remains in the trace.
 
+Each Git operation has a 30-second default timeout. Large repositories can raise it with `--git-timeout`. Structured file summaries are capped at 4 MiB; if that bound is exceeded, capture reports `omitted` without buffering an unbounded `trace.json`.
+
+A redacted patch is an observational record and is not guaranteed to apply. Redaction can intentionally replace patch body content, while `--no-redact` preserves the raw Git patch bytes.
+
 Redaction is not a complete data-loss prevention system. Review every trace before sharing or exporting it.
