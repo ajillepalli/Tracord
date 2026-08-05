@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .bundle import validate_run_id
 from .ci_output import CIOutputError, project_list_run
-from .result_codes import CI_RUN_ID
+from .result_codes import CI_RUN_ID, MAX_LIST_RUNS
 from .storage import (
     StoreSafetyError,
     prepare_store_for_read,
@@ -18,7 +18,6 @@ from .storage import (
 from .trace_access import TraceAccessError, read_trace, resolve_store_candidate
 
 
-MAX_LIST_RUNS = 1_000
 MAX_LIST_CANDIDATES = 10_000
 MAX_LIST_TRACE_BYTES = 16 * 1024 * 1024
 MAX_LIST_AGGREGATE_BYTES = 64 * 1024 * 1024

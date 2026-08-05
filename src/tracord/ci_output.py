@@ -26,6 +26,7 @@ from .result_codes import (
     DECODE_REPLACEMENT_STATES,
     LIST_ERROR_CODES,
     LIST_RESULT_VERSION,
+    MAX_LIST_RUNS,
     MAX_PROCESS_EXIT_CODE,
     MAX_SAFE_JSON_INTEGER,
     MIN_PROCESS_EXIT_CODE,
@@ -230,7 +231,7 @@ def build_list_result(
     if not isinstance(truncated, bool):
         raise CIOutputError("invalid truncated flag")
     projected_runs = [project_list_run(run) for run in runs]
-    if len(projected_runs) > 1_000:
+    if len(projected_runs) > MAX_LIST_RUNS:
         raise CIOutputError("too many list runs")
     if error_code is None:
         if exit_code != 0:

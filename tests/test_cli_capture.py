@@ -1,4 +1,5 @@
 import argparse
+import errno
 import os
 import site
 import subprocess
@@ -75,6 +76,20 @@ def test_console_main_does_not_swallow_command_oserror(monkeypatch):
 
     with pytest.raises(PermissionError, match="store denied"):
         console_main([])
+
+
+@pytest.mark.parametrize("error_number", [errno.EPIPE, errno.EINVAL, errno.EBADF])
+def test_console_main_maps_platform_pipe_errors_to_transport_exit(
+    monkeypatch, error_number
+):
+    def transport_failure(_argv):
+        raise OSError(error_number, "closed standard stream")
+
+    monkeypatch.setattr("tracord.cli.main", transport_failure)
+    monkeypatch.setattr(sys, "stdout", BrokenFlush())
+    monkeypatch.setattr(sys, "stderr", BrokenFlush())
+
+    assert console_main([]) == JSON_OUTPUT_FAILURE_EXIT_CODE
 
 
 @pytest.mark.parametrize("entrypoint", ["module", "console"])

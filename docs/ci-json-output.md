@@ -81,7 +81,9 @@ is `present` or `unknown`. Legacy completed traces without this metadata infer
 Output run IDs use the ASCII grammar
 `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`. A filesystem-valid imported run with an ID
 outside that grammar can still be operated on where supported, but its unsafe
-ID is never copied into a CI result.
+ID is never copied into a CI result. Assertion case names use the same output
+grammar; a file-mode result can therefore contain `case: null` when the
+operational case name is unsafe for CI output.
 
 ## List ordering and completeness
 
@@ -107,7 +109,9 @@ charged. The overflow sentinel is never opened and does not increment
 
 All entries under `runs/` are considered, including stray files and dotfiles;
 unsafe or non-run debris increments `skipped` so it cannot silently weaken the
-completeness oracle.
+completeness oracle. On shared stores, in-flight publication can transiently
+raise `skipped`, while persistent debris keeps the oracle incomplete until the
+entry is removed.
 
 `list --json` is a completeness oracle only when `skipped == 0` and
 `truncated == false`. Directory enumeration is not a transactional filesystem

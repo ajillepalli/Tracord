@@ -15,6 +15,7 @@ from tracord.result_codes import (
     ASSERTION_FAILURE_CODES,
     CI_RUN_ID_SCHEMA_PATTERN,
     LIST_ERROR_CODES,
+    MAX_LIST_RUNS,
     MAX_PROCESS_EXIT_CODE,
     MAX_SAFE_JSON_INTEGER,
     RECORD_ERROR_CODES,
@@ -118,6 +119,7 @@ def test_schema_patterns_equal_leaf_owned_patterns():
         assertion["properties"]["error_location"]["pattern"]
         == ASSERTION_ERROR_LOCATION_SCHEMA_PATTERN
     )
+    assert load_schema("list")["properties"]["runs"]["maxItems"] == MAX_LIST_RUNS
 
 
 @pytest.mark.parametrize("command", SCHEMA_NAMES)

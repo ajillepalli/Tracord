@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import math
 import os
@@ -64,7 +65,13 @@ def console_main(argv: list[str] | None = None) -> int:
             exit_code = main(argv)
         except SystemExit as exc:
             exit_code = _system_exit_code(exc.code)
-    except BrokenPipeError:
+    except OSError as exc:
+        if not isinstance(exc, BrokenPipeError) and exc.errno not in {
+            errno.EPIPE,
+            errno.EINVAL,
+            errno.EBADF,
+        }:
+            raise
         _silence_broken_standard_streams()
         return JSON_OUTPUT_FAILURE_EXIT_CODE
     try:

@@ -59,12 +59,14 @@ jobs:
                   Path(name).name
                   for name in archive.namelist()
                   if Path(name).parts[:2] == ("tracord", "schemas")
+                  and name.endswith(".json")
               }
           with tarfile.open(sdist) as archive:
               sdist_schemas = {
                   Path(name).name
                   for name in archive.getnames()
                   if Path(name).parts[1:4] == ("src", "tracord", "schemas")
+                  and name.endswith(".json")
               }
           assert wheel_schemas == expected
           assert sdist_schemas == expected
