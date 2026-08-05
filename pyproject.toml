@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tracord"
+version = "0.1.0"
+description = "Local-first flight recorder for agentic software."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+  { name = "Tracord contributors" }
+]
+keywords = [
+  "ai-agents",
+  "agent-observability",
+  "agent-tracing",
+  "mcp",
+  "replay",
+  "developer-tools",
+  "cli"
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Debuggers",
+  "Topic :: System :: Logging"
+]
+
+[project.urls]
+Homepage = "https://github.com/ajillepalli/Tracord"
+Repository = "https://github.com/ajillepalli/Tracord"
+Issues = "https://github.com/ajillepalli/Tracord/issues"
+
+[project.scripts]
+tracord = "tracord.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tracord"]
