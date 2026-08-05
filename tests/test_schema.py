@@ -404,10 +404,17 @@ def structural_parity_events():
     valid_max_error_type["data"]["error_type"] = "A" + ("x" * 63)
     valid_max_identifiers = tool_started("A" * 512)
     valid_max_identifiers["data"]["name"] = "N" * 512
+    valid_max_finished_identifier = tool_finished("A" * 512)
 
     invalid_started = tool_started(include_value=False)
     invalid_missing_started_data = tool_started()
     del invalid_missing_started_data["data"]
+    invalid_missing_started_call_id = tool_started()
+    del invalid_missing_started_call_id["data"]["call_id"]
+    invalid_missing_tool_name = tool_started()
+    del invalid_missing_tool_name["data"]["name"]
+    invalid_started_extra = tool_started()
+    invalid_started_extra["data"]["extra"] = True
     invalid_input = tool_started(value=[])
     invalid_missing_input = tool_started()
     del invalid_missing_input["data"]["input"]
@@ -416,12 +423,15 @@ def structural_parity_events():
     invalid_empty_started_call_id = tool_started("")
     invalid_long_started_call_id = tool_started("A" * 513)
     invalid_control_started_call_id = tool_started("unsafe\nidentifier")
+    invalid_del_started_call_id = tool_started("unsafe\u007fidentifier")
     invalid_empty_tool_name = tool_started()
     invalid_empty_tool_name["data"]["name"] = ""
     invalid_long_tool_name = tool_started()
     invalid_long_tool_name["data"]["name"] = "N" * 513
     invalid_control_tool_name = tool_started()
     invalid_control_tool_name["data"]["name"] = "unsafe\tname"
+    invalid_c1_tool_name = tool_started()
+    invalid_c1_tool_name["data"]["name"] = "unsafe\u0085name"
     invalid_capture = tool_started(capture="invalid")
     invalid_omitted_value = tool_started(capture="omitted", include_value=True)
     invalid_capture_extra = tool_started()
@@ -434,6 +444,8 @@ def structural_parity_events():
     invalid_nonobject_output = tool_finished()
     invalid_nonobject_output["data"]["output"] = []
     invalid_empty_finished_call_id = tool_finished("")
+    invalid_long_finished_call_id = tool_finished("A" * 513)
+    invalid_control_finished_call_id = tool_finished("unsafe\u0085identifier")
     invalid_output_capture = tool_finished(capture="invalid")
     invalid_omitted_output_value = tool_finished(capture="omitted", include_value=True)
     invalid_output_extra = tool_finished()
@@ -463,17 +475,23 @@ def structural_parity_events():
         (valid_failed, True),
         (valid_max_error_type, True),
         (valid_max_identifiers, True),
+        (valid_max_finished_identifier, True),
         (invalid_started, False),
         (invalid_missing_started_data, False),
+        (invalid_missing_started_call_id, False),
+        (invalid_missing_tool_name, False),
+        (invalid_started_extra, False),
         (invalid_input, False),
         (invalid_missing_input, False),
         (invalid_nonobject_input, False),
         (invalid_empty_started_call_id, False),
         (invalid_long_started_call_id, False),
         (invalid_control_started_call_id, False),
+        (invalid_del_started_call_id, False),
         (invalid_empty_tool_name, False),
         (invalid_long_tool_name, False),
         (invalid_control_tool_name, False),
+        (invalid_c1_tool_name, False),
         (invalid_capture, False),
         (invalid_omitted_value, False),
         (invalid_capture_extra, False),
@@ -482,6 +500,8 @@ def structural_parity_events():
         (invalid_missing_output, False),
         (invalid_nonobject_output, False),
         (invalid_empty_finished_call_id, False),
+        (invalid_long_finished_call_id, False),
+        (invalid_control_finished_call_id, False),
         (invalid_output_capture, False),
         (invalid_omitted_output_value, False),
         (invalid_output_extra, False),

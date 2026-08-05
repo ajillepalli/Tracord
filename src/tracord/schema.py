@@ -362,10 +362,6 @@ def _validate_tool_call_lifecycle(
             finished.add(call_id)
 
 
-def _is_non_empty_string(value: object) -> bool:
-    return isinstance(value, str) and bool(value)
-
-
 def _is_tool_identifier(value: object) -> bool:
     return (
         isinstance(value, str)
