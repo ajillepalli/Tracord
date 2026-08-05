@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import json
+import math
 import os
 import stat
 from collections.abc import Mapping
@@ -32,12 +33,46 @@ MAX_TOTAL_ARTIFACT_BYTES = 16 * 1024 * 1024
 READ_CHUNK_BYTES = 1024 * 1024
 MAX_NEEDLE_BYTES = 65_536
 TAIL_BYTES = MAX_NEEDLE_BYTES - 1
+MAX_JSON_INTEGER_DIGITS = 128
+_EXPECTATION_LOCATIONS = frozenset(
+    {
+        "status",
+        "exit_code",
+        "stdout_contains",
+        "stderr_contains",
+        "max_duration_ms",
+        "no_timeout",
+    }
+)
+_RUN_ERROR_CODES = frozenset(
+    {
+        "invalid_run_id",
+        "run_not_found",
+        "trace_unreadable",
+        "trace_invalid",
+        "run_identity_mismatch",
+    }
+)
+_FAILURE_CODES = frozenset(
+    {
+        "artifact_unreadable",
+        "artifact_invalid_utf8",
+        "artifact_changed",
+        "assertion_mismatch",
+        "scan_incomplete",
+    }
+)
+_VALIDATION_CODES = frozenset(
+    {"assertion_value_invalid", "assertion_no_expectations"}
+)
 
 
 class ExpectationValidationError(ValueError):
     """A fixed-code expectation construction error."""
 
     def __init__(self, code: str) -> None:
+        if code not in _VALIDATION_CODES:
+            raise ValueError("unknown expectation validation code")
         self.code = code
         super().__init__(code)
 
@@ -46,6 +81,10 @@ class AssertionRunError(ValueError):
     """A fixed-code run evaluation error."""
 
     def __init__(self, code: str, location: str | None = None) -> None:
+        if code not in _RUN_ERROR_CODES:
+            raise ValueError("unknown assertion run error code")
+        if location is not None and location not in _EXPECTATION_LOCATIONS:
+            raise ValueError("unsafe assertion run error location")
         self.code = code
         self.location = location
         super().__init__(code)
@@ -56,60 +95,54 @@ class AssertionFailure:
     code: str
     location: str
 
+    def __post_init__(self) -> None:
+        if self.code not in _FAILURE_CODES:
+            raise ValueError("unknown assertion failure code")
+        if self.location not in _EXPECTATION_LOCATIONS:
+            raise ValueError("unsafe assertion failure location")
+
 
 @dataclass(frozen=True)
 class TraceExpectations:
     status: str | None = None
     exit_code: int | None = None
-    stdout_contains: str | bytes | None = field(default=None, repr=False)
-    stderr_contains: str | bytes | None = field(default=None, repr=False)
+    stdout_contains: str | None = field(default=None, repr=False)
+    stderr_contains: str | None = field(default=None, repr=False)
     max_duration_ms: int | None = None
     no_timeout: bool = False
-    stdout_contains_bytes: bytes | None = field(init=False, repr=False)
-    stderr_contains_bytes: bytes | None = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "stdout_contains_bytes",
-            _try_encode_needle(self.stdout_contains),
-        )
-        object.__setattr__(
-            self,
-            "stderr_contains_bytes",
-            _try_encode_needle(self.stderr_contains),
-        )
 
 
-def validate_expectations(expectations: TraceExpectations) -> None:
+@dataclass(frozen=True, slots=True)
+class _ValidatedExpectations:
+    status: str | None
+    exit_code: int | None
+    stdout_needle: bytes | None
+    stderr_needle: bytes | None
+    max_duration_ms: int | None
+    no_timeout: bool
+
+
+def validate_expectations(expectations: TraceExpectations) -> _ValidatedExpectations:
     """Validate expectation values before any run or assertion-file I/O."""
     if not isinstance(expectations, TraceExpectations):
-        raise ExpectationValidationError("invalid_expectations")
+        raise ExpectationValidationError("assertion_value_invalid")
     if expectations.status is not None and expectations.status not in STATUSES:
-        raise ExpectationValidationError("invalid_status_expectation")
+        raise ExpectationValidationError("assertion_value_invalid")
     if expectations.exit_code is not None and (
         not isinstance(expectations.exit_code, int)
         or isinstance(expectations.exit_code, bool)
     ):
-        raise ExpectationValidationError("invalid_exit_code_expectation")
+        raise ExpectationValidationError("assertion_value_invalid")
     if expectations.max_duration_ms is not None and (
         not isinstance(expectations.max_duration_ms, int)
         or isinstance(expectations.max_duration_ms, bool)
         or expectations.max_duration_ms < 0
     ):
-        raise ExpectationValidationError("invalid_duration_expectation")
+        raise ExpectationValidationError("assertion_value_invalid")
     if not isinstance(expectations.no_timeout, bool):
-        raise ExpectationValidationError("invalid_timeout_expectation")
-    if (
-        expectations.stdout_contains is not None
-        and expectations.stdout_contains_bytes is None
-    ):
-        raise ExpectationValidationError("invalid_stdout_expectation")
-    if (
-        expectations.stderr_contains is not None
-        and expectations.stderr_contains_bytes is None
-    ):
-        raise ExpectationValidationError("invalid_stderr_expectation")
+        raise ExpectationValidationError("assertion_value_invalid")
+    stdout_needle = _encode_needle(expectations.stdout_contains)
+    stderr_needle = _encode_needle(expectations.stderr_contains)
     if not any(
         (
             expectations.status is not None,
@@ -120,7 +153,15 @@ def validate_expectations(expectations: TraceExpectations) -> None:
             expectations.no_timeout,
         )
     ):
-        raise ExpectationValidationError("expectation_required")
+        raise ExpectationValidationError("assertion_no_expectations")
+    return _ValidatedExpectations(
+        status=expectations.status,
+        exit_code=expectations.exit_code,
+        stdout_needle=stdout_needle,
+        stderr_needle=stderr_needle,
+        max_duration_ms=expectations.max_duration_ms,
+        no_timeout=expectations.no_timeout,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,13 +174,41 @@ class _RunDirectory:
     initial: os.stat_result
 
 
+def _reject_json_constant(_: str) -> float:
+    raise ValueError("nonfinite JSON number")
+
+
+def _finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("nonfinite JSON number")
+    return parsed
+
+
+def _bounded_json_integer(value: str) -> int:
+    if len(value.removeprefix("-")) > MAX_JSON_INTEGER_DIGITS:
+        raise ValueError("oversized JSON integer")
+    return int(value)
+
+
+def _json_object_without_duplicates(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
 def evaluate_run(
     root: Path,
     run_id: str,
     expectations: TraceExpectations,
 ) -> tuple[str, list[AssertionFailure]]:
     """Evaluate one run and return only stable, content-free failure codes."""
-    validate_expectations(expectations)
+    validated = validate_expectations(expectations)
     if not isinstance(run_id, str):
         raise AssertionRunError("invalid_run_id")
     try:
@@ -158,24 +227,28 @@ def evaluate_run(
     try:
         trace_text = trace_bytes.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
-        raise AssertionRunError("trace_invalid_utf8") from None
-    try:
-        trace = json.loads(trace_text)
-    except RecursionError:
         raise AssertionRunError("trace_invalid") from None
-    except (json.JSONDecodeError, ValueError):
-        raise AssertionRunError("trace_invalid_json") from None
+    try:
+        trace = json.loads(
+            trace_text,
+            object_pairs_hook=_json_object_without_duplicates,
+            parse_constant=_reject_json_constant,
+            parse_float=_finite_json_float,
+            parse_int=_bounded_json_integer,
+        )
+    except (RecursionError, UnicodeDecodeError, ValueError):
+        raise AssertionRunError("trace_invalid") from None
     if not isinstance(trace, dict) or validate_trace(trace):
         raise AssertionRunError("trace_invalid")
     if trace.get("run_id") != run_id:
-        raise AssertionRunError("trace_run_id_mismatch")
+        raise AssertionRunError("run_identity_mismatch")
 
     failures: list[AssertionFailure] = []
-    if expectations.status is not None and trace.get("status") != expectations.status:
+    if validated.status is not None and trace.get("status") != validated.status:
         failures.append(AssertionFailure("assertion_mismatch", "status"))
     if (
-        expectations.exit_code is not None
-        and trace.get("exit_code") != expectations.exit_code
+        validated.exit_code is not None
+        and trace.get("exit_code") != validated.exit_code
     ):
         failures.append(AssertionFailure("assertion_mismatch", "exit_code"))
 
@@ -185,7 +258,7 @@ def evaluate_run(
         artifacts.get("stdout") if isinstance(artifacts, Mapping) else None,
         trace_dir=run.path,
         label="stdout",
-        expected=expectations.stdout_contains_bytes,
+        expected=validated.stdout_needle,
         remaining_bytes=remaining_bytes,
     )
     remaining_bytes -= stdout_read
@@ -196,7 +269,7 @@ def evaluate_run(
         artifacts.get("stderr") if isinstance(artifacts, Mapping) else None,
         trace_dir=run.path,
         label="stderr",
-        expected=expectations.stderr_contains_bytes,
+        expected=validated.stderr_needle,
         remaining_bytes=remaining_bytes,
     )
     if stderr_failure is not None:
@@ -204,12 +277,12 @@ def evaluate_run(
 
     duration_ms = trace.get("duration_ms")
     if (
-        expectations.max_duration_ms is not None
+        validated.max_duration_ms is not None
         and isinstance(duration_ms, int)
-        and duration_ms > expectations.max_duration_ms
+        and duration_ms > validated.max_duration_ms
     ):
         failures.append(AssertionFailure("assertion_mismatch", "max_duration_ms"))
-    if expectations.no_timeout and trace.get("timed_out") is not False:
+    if validated.no_timeout and trace.get("timed_out") is not False:
         failures.append(AssertionFailure("assertion_mismatch", "no_timeout"))
 
     run_failure = _verify_run_directory(run)
@@ -218,21 +291,17 @@ def evaluate_run(
     return run.path.name, failures
 
 
-def _try_encode_needle(value: str | bytes | None) -> bytes | None:
+def _encode_needle(value: str | None) -> bytes | None:
     if value is None:
         return None
     try:
-        if isinstance(value, str):
-            encoded = value.encode("utf-8", errors="strict")
-        elif isinstance(value, bytes):
-            value.decode("utf-8", errors="strict")
-            encoded = value
-        else:
+        if not isinstance(value, str):
             raise TypeError
+        encoded = value.encode("utf-8", errors="strict")
     except (TypeError, UnicodeError):
-        return None
+        raise ExpectationValidationError("assertion_value_invalid") from None
     if not encoded or len(encoded) > MAX_NEEDLE_BYTES:
-        return None
+        raise ExpectationValidationError("assertion_value_invalid")
     return encoded
 
 
@@ -246,7 +315,7 @@ def _resolve_run_directory(
     except FileNotFoundError:
         return None, "run_not_found"
     except OSError:
-        return None, "run_directory_unreadable"
+        return None, "run_not_found"
     if (
         is_link_or_junction(root, root_initial)
         or not stat.S_ISDIR(root_initial.st_mode)
@@ -254,43 +323,49 @@ def _resolve_run_directory(
         or not stat.S_ISDIR(runs_initial.st_mode)
         or containment_issue(root, runs_path) is not None
     ):
-        return None, "run_directory_unsafe"
+        return None, "run_identity_mismatch"
 
     try:
         with os.scandir(runs_path) as entries:
-            exact_name = next((entry.name for entry in entries if entry.name == run_id), None)
+            names = [entry.name for entry in entries]
     except OSError:
-        return None, "run_directory_unreadable"
+        return None, "run_not_found"
+    exact_name = next((name for name in names if name == run_id), None)
+    aliases = [name for name in names if name.casefold() == run_id.casefold()]
+    if exact_name is not None and aliases != [exact_name]:
+        return None, "run_identity_mismatch"
     if exact_name is None:
+        if aliases:
+            return None, "run_identity_mismatch"
         return None, "run_not_found"
 
     path = runs_path / exact_name
     if containment_issue(runs_path, path) is not None:
-        return None, "run_directory_unsafe"
+        return None, "run_identity_mismatch"
     try:
         initial = path.lstat()
     except FileNotFoundError:
         return None, "run_not_found"
     except OSError:
-        return None, "run_directory_unreadable"
+        return None, "run_not_found"
     if is_link_or_junction(path, initial) or not stat.S_ISDIR(initial.st_mode):
-        return None, "run_directory_unsafe"
+        return None, "run_identity_mismatch"
 
     try:
         root_checked = root.lstat()
         runs_checked = runs_path.lstat()
         checked = path.lstat()
     except OSError:
-        return None, "run_directory_changed"
+        return None, "run_identity_mismatch"
     identity = combine_identity(
         compare_snapshot(root_initial, root_checked),
         compare_snapshot(runs_initial, runs_checked),
         compare_snapshot(initial, checked),
     )
     if identity is IdentityComparison.DIFFERENT:
-        return None, "run_directory_changed"
+        return None, "run_identity_mismatch"
     if identity is IdentityComparison.UNAVAILABLE:
-        return None, "run_directory_identity_unverified"
+        return None, "run_identity_mismatch"
     return _RunDirectory(
         root,
         root_initial,
@@ -307,7 +382,7 @@ def _verify_run_directory(run: _RunDirectory) -> str | None:
         runs_final = run.runs_path.lstat()
         final = run.path.lstat()
     except OSError:
-        return "run_directory_changed"
+        return "run_identity_mismatch"
     if (
         is_link_or_junction(run.root_path, root_final)
         or not stat.S_ISDIR(root_final.st_mode)
@@ -318,16 +393,16 @@ def _verify_run_directory(run: _RunDirectory) -> str | None:
         or containment_issue(run.root_path, run.runs_path) is not None
         or containment_issue(run.runs_path, run.path) is not None
     ):
-        return "run_directory_changed"
+        return "run_identity_mismatch"
     identity = combine_identity(
         compare_snapshot(run.root_initial, root_final),
         compare_snapshot(run.runs_initial, runs_final),
         compare_snapshot(run.initial, final),
     )
     if identity is IdentityComparison.DIFFERENT:
-        return "run_directory_changed"
+        return "run_identity_mismatch"
     if identity is IdentityComparison.UNAVAILABLE:
-        return "run_directory_identity_unverified"
+        return "run_identity_mismatch"
     return None
 
 
@@ -337,24 +412,22 @@ def _read_trace(trace_dir: Path) -> tuple[bytes | None, str | None]:
             trace_dir, TRACE_FILE, require_single_link=True
         )
     except SafePathError as exc:
-        if exc.reason == "missing":
-            return None, "trace_missing"
         return None, "trace_unreadable"
     if prepared.initial.st_size > MAX_TRACE_BYTES:
-        return None, "trace_too_large"
+        return None, "trace_unreadable"
 
     try:
         with open_prepared_file(prepared) as opened:
             data, short_read = _read_exact(opened.stream, prepared.initial.st_size)
             identity = verify_opened_file(opened)
     except SafePathError as exc:
-        return None, "trace_changed" if exc.reason == "changed" else "trace_unreadable"
+        return None, "trace_unreadable"
     except OSError:
         return None, "trace_unreadable"
     if short_read:
         return None, "trace_unreadable"
     if identity is IdentityComparison.UNAVAILABLE:
-        return None, "trace_identity_unverified"
+        return None, "trace_unreadable"
     return data, None
 
 
@@ -370,18 +443,16 @@ def _contains_failure(
     if expected is None:
         return None, 0
     if not isinstance(artifact_name, str) or not artifact_name:
-        return AssertionFailure("assertion_artifact_missing", location), 0
+        return AssertionFailure("artifact_unreadable", location), 0
     if remaining_bytes <= 0:
-        return AssertionFailure("assertion_scan_incomplete", location), 0
+        return AssertionFailure("scan_incomplete", location), 0
 
     try:
         prepared = prepare_regular_file(
             trace_dir, artifact_name, require_single_link=True
         )
     except SafePathError as exc:
-        if exc.reason == "missing":
-            return AssertionFailure("assertion_artifact_missing", location), 0
-        return AssertionFailure("assertion_artifact_unreadable", location), 0
+        return AssertionFailure("artifact_unreadable", location), 0
 
     read_limit = min(
         prepared.initial.st_size,
@@ -425,24 +496,24 @@ def _contains_failure(
             identity = verify_opened_file(opened)
     except SafePathError as exc:
         code = (
-            "assertion_artifact_changed"
+            "artifact_changed"
             if exc.reason == "changed"
-            else "assertion_artifact_unreadable"
+            else "artifact_unreadable"
         )
         return AssertionFailure(code, location), bytes_read
     except OSError:
-        return AssertionFailure("assertion_artifact_unreadable", location), bytes_read
+        return AssertionFailure("artifact_unreadable", location), bytes_read
 
     if short_read:
-        return AssertionFailure("assertion_artifact_unreadable", location), bytes_read
+        return AssertionFailure("artifact_unreadable", location), bytes_read
     if identity is IdentityComparison.UNAVAILABLE:
-        return AssertionFailure("assertion_identity_unverified", location), bytes_read
+        return AssertionFailure("artifact_unreadable", location), bytes_read
     if invalid_utf8:
-        return AssertionFailure("assertion_artifact_invalid_utf8", location), bytes_read
+        return AssertionFailure("artifact_invalid_utf8", location), bytes_read
     if matched:
         return None, bytes_read
     if not scan_complete:
-        return AssertionFailure("assertion_scan_incomplete", location), bytes_read
+        return AssertionFailure("scan_incomplete", location), bytes_read
     return AssertionFailure("assertion_mismatch", location), bytes_read
 
 

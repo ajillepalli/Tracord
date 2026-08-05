@@ -75,14 +75,28 @@ values are capped at 65,536 UTF-8 bytes. Evaluation resolves an exact portable
 run ID without creating storage, reads a regular single-link `trace.json` with
 a 16 MiB limit, and requires the requested ID, directory name, and trace ID to
 agree. Referenced artifacts must remain contained regular single-link files.
-Stdout and stderr are scanned completely as strict UTF-8 with 10 MiB per-file
-and 16 MiB aggregate limits; a match does not bypass size, identity, or snapshot
-verification.
+Stdout and stderr receive strict UTF-8 coverage with 10 MiB per-file and 16 MiB
+aggregate limits. A match in verified covered bytes satisfies its field, while
+an uncovered negative result is `scan_incomplete`; a match never bypasses
+identity or snapshot verification.
 
 The CLI keeps result classes stable: `0` passes, `1` represents trace or
 expectation failure, and `2` represents invocation, assertion-file, value, or
 case-selection errors. Public diagnostics are closed fixed codes and never
 include untrusted IDs, paths, values, content, or raw exceptions.
+
+The v0 assertion code vocabulary is closed. Invocation and file errors are
+`invalid_run_id`, `assertion_mode_conflict`, `assertion_no_expectations`,
+`assertion_value_invalid`, `assertion_file_missing`,
+`assertion_file_unreadable`, `assertion_file_not_regular`,
+`assertion_file_changed`, `assertion_file_too_large`, `assertion_file_bom`,
+`assertion_file_invalid_utf8`, `assertion_file_duplicate_key`,
+`assertion_file_invalid_json`, `assertion_file_schema_invalid`, and
+`case_not_found`. Evaluation errors are `run_not_found`, `trace_unreadable`,
+`trace_invalid`, `run_identity_mismatch`, `artifact_unreadable`,
+`artifact_invalid_utf8`, `artifact_changed`, `assertion_mismatch`, and
+`scan_incomplete`. Adding a public code or expectation field requires a new
+assertion format version.
 
 ## File Change Model
 

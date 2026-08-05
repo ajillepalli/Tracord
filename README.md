@@ -101,7 +101,9 @@ Case names use portable ASCII letters, digits, `.`, `_`, and `-`, are unique
 under ASCII case folding, and contain at most 128 characters. Containment values
 are limited to 65,536 UTF-8 bytes. Evaluation reads `trace.json` through a
 bounded 16 MiB descriptor and scans regular, single-link stdout and stderr
-artifacts completely using a 10 MiB per-file and 16 MiB aggregate limit.
+artifacts with 10 MiB per-file and 16 MiB aggregate coverage. A positive match
+within verified coverage passes that field; a negative result that reaches a
+coverage limit reports `scan_incomplete` rather than a plain mismatch.
 
 Assertion commands return `0` when every expectation passes, `1` for a trace or
 expectation failure, and `2` for invalid mode, values, files, or case selection.

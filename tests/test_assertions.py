@@ -1,6 +1,6 @@
 import json
 import os
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
@@ -190,13 +190,13 @@ def test_evaluate_run_reports_closed_failures_without_expected_values(tmp_path: 
 @pytest.mark.parametrize(
     ("kwargs", "code"),
     [
-        ({}, "expectation_required"),
-        ({"status": "unknown"}, "invalid_status_expectation"),
-        ({"exit_code": True}, "invalid_exit_code_expectation"),
-        ({"max_duration_ms": -1}, "invalid_duration_expectation"),
-        ({"stdout_contains": ""}, "invalid_stdout_expectation"),
-        ({"stderr_contains": b"\xff"}, "invalid_stderr_expectation"),
-        ({"stdout_contains": "x" * (MAX_NEEDLE_BYTES + 1)}, "invalid_stdout_expectation"),
+        ({}, "assertion_no_expectations"),
+        ({"status": "unknown"}, "assertion_value_invalid"),
+        ({"exit_code": True}, "assertion_value_invalid"),
+        ({"max_duration_ms": -1}, "assertion_value_invalid"),
+        ({"stdout_contains": ""}, "assertion_value_invalid"),
+        ({"stderr_contains": "\ud800"}, "assertion_value_invalid"),
+        ({"stdout_contains": "x" * (MAX_NEEDLE_BYTES + 1)}, "assertion_value_invalid"),
     ],
 )
 def test_expectations_are_validated_and_preencoded(kwargs: dict[str, object], code: str):
@@ -208,9 +208,20 @@ def test_expectations_are_validated_and_preencoded(kwargs: dict[str, object], co
 
 def test_expectation_bytes_are_encoded_once():
     expectations = TraceExpectations(stdout_contains="snowman-\u2603")
+    validated = validate_expectations(expectations)
 
-    assert expectations.stdout_contains_bytes == "snowman-\u2603".encode()
-    assert "snowman" not in repr(expectations)
+    assert validated.stdout_needle == "snowman-\u2603".encode()
+
+
+def test_public_expectation_shape_is_frozen_to_six_fields():
+    assert [item.name for item in fields(TraceExpectations)] == [
+        "status",
+        "exit_code",
+        "stdout_contains",
+        "stderr_contains",
+        "max_duration_ms",
+        "no_timeout",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -218,7 +229,7 @@ def test_expectation_bytes_are_encoded_once():
     [
         ("../outside", "invalid_run_id"),
         ("missing", "run_not_found"),
-        ("RUN-1", "run_not_found"),
+        ("RUN-1", "run_identity_mismatch"),
     ],
 )
 def test_run_lookup_is_portable_exact_and_closed(
@@ -236,7 +247,32 @@ def test_trace_run_id_must_match_exact_directory_entry(tmp_path: Path):
     trace["run_id"] = "other-run"
     (trace_dir / "trace.json").write_text(json.dumps(trace), encoding="utf-8")
 
-    assert _run_error(root, _expect()) == "trace_run_id_mismatch"
+    assert _run_error(root, _expect()) == "run_identity_mismatch"
+
+
+def test_trace_duplicate_keys_are_invalid(tmp_path: Path):
+    root = tmp_path / "store"
+    trace, trace_dir = _write_run(root)
+    encoded = json.dumps(trace).replace(
+        '"run_id": "run-1"',
+        '"run_id": "run-1", "run_id": "run-1"',
+        1,
+    )
+    (trace_dir / "trace.json").write_text(encoded, encoding="utf-8")
+
+    assert _run_error(root, _expect()) == "trace_invalid"
+
+
+def test_exact_run_is_rejected_when_casefold_alias_also_exists(tmp_path: Path):
+    root = tmp_path / "store"
+    _write_run(root)
+    alias = root / "runs" / "RUN-1"
+    try:
+        alias.mkdir()
+    except FileExistsError:
+        pytest.skip("filesystem does not permit case-distinct aliases")
+
+    assert _run_error(root, _expect()) == "run_identity_mismatch"
 
 
 def test_symlinked_store_root_is_rejected(tmp_path: Path):
@@ -248,7 +284,7 @@ def test_symlinked_store_root_is_rejected(tmp_path: Path):
     except OSError:
         pytest.skip("directory symlink creation is unavailable")
 
-    assert _run_error(linked_root, _expect()) == "run_directory_unsafe"
+    assert _run_error(linked_root, _expect()) == "run_identity_mismatch"
 
 
 def test_trace_read_accepts_exact_limit_and_rejects_one_byte_over(
@@ -263,7 +299,7 @@ def test_trace_read_accepts_exact_limit_and_rejects_one_byte_over(
 
     with (trace_dir / "trace.json").open("ab") as stream:
         stream.write(b" ")
-    assert _run_error(root, _expect()) == "trace_too_large"
+    assert _run_error(root, _expect()) == "trace_unreadable"
 
 
 def test_trace_hardlink_is_rejected(tmp_path: Path):
@@ -286,7 +322,7 @@ def test_artifact_hardlink_is_rejected(tmp_path: Path):
         pytest.skip("hardlink creation is unavailable")
 
     assert _failures(root, TraceExpectations(stdout_contains="tracord")) == [
-        AssertionFailure("assertion_artifact_unreadable", "stdout_contains")
+        AssertionFailure("artifact_unreadable", "stdout_contains")
     ]
 
 
@@ -304,7 +340,7 @@ def test_link_parent_is_rejected_without_following_it(tmp_path: Path):
     (trace_dir / "trace.json").write_text(json.dumps(trace), encoding="utf-8")
 
     assert _failures(root, TraceExpectations(stdout_contains="needle")) == [
-        AssertionFailure("assertion_artifact_unreadable", "stdout_contains")
+        AssertionFailure("artifact_unreadable", "stdout_contains")
     ]
 
 
@@ -313,7 +349,7 @@ def test_match_spanning_read_chunks_is_found(tmp_path: Path, monkeypatch: pytest
     _write_run(root, stdout=b"abcTARGETxyz")
     monkeypatch.setattr(assertions_module, "READ_CHUNK_BYTES", 5)
 
-    assert _failures(root, TraceExpectations(stdout_contains=b"TARGET")) == []
+    assert _failures(root, TraceExpectations(stdout_contains="TARGET")) == []
 
 
 def test_invalid_utf8_after_early_match_takes_precedence(tmp_path: Path):
@@ -321,7 +357,7 @@ def test_invalid_utf8_after_early_match_takes_precedence(tmp_path: Path):
     _write_run(root, stdout=b"needle then invalid \xff")
 
     assert _failures(root, TraceExpectations(stdout_contains="needle")) == [
-        AssertionFailure("assertion_artifact_invalid_utf8", "stdout_contains")
+        AssertionFailure("artifact_invalid_utf8", "stdout_contains")
     ]
 
 
@@ -340,7 +376,7 @@ def test_early_match_does_not_hide_post_read_race(
     monkeypatch.setattr(assertions_module, "verify_opened_file", race_after_artifact)
 
     assert _failures(root, TraceExpectations(stdout_contains="needle")) == [
-        AssertionFailure("assertion_artifact_changed", "stdout_contains")
+        AssertionFailure("artifact_changed", "stdout_contains")
     ]
 
 
@@ -368,7 +404,7 @@ def test_zero_inode_artifact_identity_fails_closed(
     monkeypatch.setattr(assertions_module, "prepare_regular_file", zero_stdout)
 
     assert _failures(root, TraceExpectations(stdout_contains="tracord")) == [
-        AssertionFailure("assertion_identity_unverified", "stdout_contains")
+        AssertionFailure("artifact_unreadable", "stdout_contains")
     ]
 
 
@@ -434,7 +470,7 @@ def test_premature_eof_is_unreadable(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(assertions_module, "open_prepared_file", early_eof_open)
 
     assert _failures(root, TraceExpectations(stdout_contains="needle")) == [
-        AssertionFailure("assertion_artifact_unreadable", "stdout_contains")
+        AssertionFailure("artifact_unreadable", "stdout_contains")
     ]
 
 
@@ -450,7 +486,7 @@ def test_per_file_cap_boundary_and_match_precedence(
     (trace_dir / "stdout.log").write_bytes(b"needle---beyond")
     assert _failures(root, TraceExpectations(stdout_contains="needle")) == []
     assert _failures(root, TraceExpectations(stdout_contains="absent")) == [
-        AssertionFailure("assertion_scan_incomplete", "stdout_contains")
+        AssertionFailure("scan_incomplete", "stdout_contains")
     ]
 
 
@@ -477,4 +513,4 @@ def test_aggregate_limit_is_consumed_stdout_then_stderr(
             stdout_contains="stdout",
             stderr_contains="needle",
         ),
-    ) == [AssertionFailure("assertion_scan_incomplete", "stderr_contains")]
+    ) == [AssertionFailure("scan_incomplete", "stderr_contains")]

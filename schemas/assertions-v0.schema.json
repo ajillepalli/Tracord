@@ -43,12 +43,14 @@
         "stdout_contains": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 65536
+          "maxLength": 65536,
+          "description": "Runtime loading additionally limits the UTF-8 encoding to 65,536 bytes."
         },
         "stderr_contains": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 65536
+          "maxLength": 65536,
+          "description": "Runtime loading additionally limits the UTF-8 encoding to 65,536 bytes."
         },
         "max_duration_ms": {
           "type": "integer",

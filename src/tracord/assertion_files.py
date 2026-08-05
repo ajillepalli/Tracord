@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
-import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -34,14 +32,17 @@ _EXPECTATION_FIELDS = (
 _TOP_LEVEL_FIELDS = ("schema_version", "cases")
 _ERROR_CODES = frozenset(
     {
-        "assertion_file_not_found",
-        "assertion_file_unsafe",
+        "assertion_file_missing",
         "assertion_file_unreadable",
+        "assertion_file_not_regular",
+        "assertion_file_changed",
         "assertion_file_too_large",
+        "assertion_file_bom",
         "assertion_file_invalid_utf8",
+        "assertion_file_duplicate_key",
         "assertion_file_invalid_json",
-        "assertion_file_invalid",
-        "assertion_case_not_found",
+        "assertion_file_schema_invalid",
+        "case_not_found",
     }
 )
 _SAFE_LOCATION = re.compile(
@@ -74,93 +75,82 @@ def parse_assertion_case(data: bytes, case_name: str) -> TraceExpectations:
     """Parse descriptor bytes and select a case after validating the whole file."""
     document = _decode_document(data)
     cases = _validate_document(document)
+    if not isinstance(case_name, str) or _CASE_NAME.fullmatch(case_name) is None:
+        raise AssertionFileError("case_not_found")
     selected = cases.get(case_name)
     if selected is None:
-        raise AssertionFileError("assertion_case_not_found")
+        raise AssertionFileError("case_not_found")
     return selected
 
 
 def _read_assertion_file(path: Path) -> bytes:
+    absolute_path = path.absolute()
+    filesystem_root = Path(absolute_path.anchor)
     try:
-        containment = paths.check_containment(path.parent, path)
-    except (OSError, ValueError):
-        raise AssertionFileError("assertion_file_unsafe") from None
-    if not _containment_passed(containment):
-        raise AssertionFileError("assertion_file_unsafe")
-
+        relative_path = absolute_path.relative_to(filesystem_root).as_posix()
+    except ValueError:
+        raise AssertionFileError("assertion_file_unreadable") from None
     try:
-        path_before = paths.stat_regular_no_follow(path)
-    except FileNotFoundError:
-        raise AssertionFileError("assertion_file_not_found") from None
-    except (OSError, ValueError):
-        raise AssertionFileError("assertion_file_unsafe") from None
-    _validate_file_snapshot(path_before)
-    if path_before.st_size > MAX_ASSERTION_FILE_BYTES:
+        prepared = paths.prepare_regular_file(
+            filesystem_root,
+            relative_path,
+            require_single_link=True,
+        )
+    except paths.SafePathError as exc:
+        raise AssertionFileError(_path_error_code(exc.reason)) from None
+    if prepared.initial.st_size > MAX_ASSERTION_FILE_BYTES:
         raise AssertionFileError("assertion_file_too_large")
 
     try:
-        opened = paths.open_regular_no_follow(path)
-        with _binary_stream(opened) as stream:
-            descriptor_before = os.fstat(stream.fileno())
-            _validate_file_snapshot(descriptor_before)
-            if not _same_snapshot(path_before, descriptor_before):
-                raise AssertionFileError("assertion_file_unsafe")
-            data = stream.read(MAX_ASSERTION_FILE_BYTES + 1)
-            descriptor_after = os.fstat(stream.fileno())
-    except AssertionFileError:
-        raise
-    except FileNotFoundError:
-        raise AssertionFileError("assertion_file_not_found") from None
-    except (OSError, ValueError):
+        with paths.open_prepared_file(prepared) as opened:
+            if opened.identity is paths.IdentityComparison.UNAVAILABLE:
+                raise AssertionFileError("assertion_file_unreadable")
+            data = _read_bounded(opened.stream, MAX_ASSERTION_FILE_BYTES)
+            identity = paths.verify_opened_file(opened)
+    except paths.SafePathError as exc:
+        code = (
+            "assertion_file_changed"
+            if exc.reason == "changed"
+            else "assertion_file_unreadable"
+        )
+        raise AssertionFileError(code) from None
+    except OSError:
         raise AssertionFileError("assertion_file_unreadable") from None
 
     if len(data) > MAX_ASSERTION_FILE_BYTES:
         raise AssertionFileError("assertion_file_too_large")
-    _validate_file_snapshot(descriptor_after)
-    if not _same_snapshot(descriptor_before, descriptor_after):
-        raise AssertionFileError("assertion_file_unsafe")
-
-    try:
-        path_after = paths.stat_regular_no_follow(path)
-        containment = paths.check_containment(path.parent, path)
-    except (OSError, ValueError):
-        raise AssertionFileError("assertion_file_unsafe") from None
-    _validate_file_snapshot(path_after)
-    if not _same_snapshot(descriptor_after, path_after) or not _containment_passed(
-        containment
-    ):
-        raise AssertionFileError("assertion_file_unsafe")
+    if identity is paths.IdentityComparison.UNAVAILABLE:
+        raise AssertionFileError("assertion_file_unreadable")
     return data
 
 
-def _binary_stream(opened: BinaryIO | int) -> BinaryIO:
-    if isinstance(opened, int):
-        return os.fdopen(opened, "rb", closefd=True)
-    return opened
+def _path_error_code(reason: str) -> str:
+    if reason == "missing":
+        return "assertion_file_missing"
+    if reason in {"symlink", "not_regular_file", "multiple_links"}:
+        return "assertion_file_not_regular"
+    if reason == "changed":
+        return "assertion_file_changed"
+    return "assertion_file_unreadable"
 
 
-def _validate_file_snapshot(info: os.stat_result) -> None:
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_nlink != 1
-        or info.st_size < 0
-    ):
-        raise AssertionFileError("assertion_file_unsafe")
-
-
-def _same_snapshot(first: os.stat_result, second: os.stat_result) -> bool:
-    return paths.same_file_snapshot(first, second) is paths.IdentityResult.SAME
-
-
-def _containment_passed(result: object) -> bool:
-    return result is None or result is True or result is paths.IdentityResult.SAME
+def _read_bounded(stream: BinaryIO, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while total <= limit:
+        chunk = stream.read(min(64 * 1024, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
 
 
 def _decode_document(data: bytes) -> object:
     if len(data) > MAX_ASSERTION_FILE_BYTES:
         raise AssertionFileError("assertion_file_too_large")
     if data.startswith(b"\xef\xbb\xbf"):
-        raise AssertionFileError("assertion_file_invalid_utf8")
+        raise AssertionFileError("assertion_file_bom")
     try:
         text = data.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
@@ -175,6 +165,8 @@ def _decode_document(data: bytes) -> object:
             parse_float=_finite_float,
             parse_int=_bounded_integer,
         )
+    except _DuplicateJsonKey:
+        raise AssertionFileError("assertion_file_duplicate_key") from None
     except (json.JSONDecodeError, _InvalidJsonValue, ValueError, RecursionError):
         raise AssertionFileError("assertion_file_invalid_json") from None
 
@@ -183,11 +175,15 @@ class _InvalidJsonValue(ValueError):
     pass
 
 
+class _DuplicateJsonKey(_InvalidJsonValue):
+    pass
+
+
 def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
-            raise _InvalidJsonValue
+            raise _DuplicateJsonKey
         result[key] = value
     return result
 
@@ -235,37 +231,37 @@ def _json_nesting_exceeds_limit(text: str) -> bool:
 
 def _validate_document(document: object) -> dict[str, TraceExpectations]:
     if not isinstance(document, Mapping):
-        raise AssertionFileError("assertion_file_invalid")
+        raise AssertionFileError("assertion_file_schema_invalid")
 
     errors: list[AssertionFileError] = []
     keys = set(document)
     for field in _TOP_LEVEL_FIELDS:
         if field not in keys:
-            errors.append(AssertionFileError("assertion_file_invalid", field))
+            errors.append(AssertionFileError("assertion_file_schema_invalid", field))
     if keys.difference(_TOP_LEVEL_FIELDS):
-        errors.append(AssertionFileError("assertion_file_invalid"))
+        errors.append(AssertionFileError("assertion_file_schema_invalid"))
 
     version = document.get("schema_version")
     if version != ASSERTION_FILE_VERSION:
-        errors.append(AssertionFileError("assertion_file_invalid", "schema_version"))
+        errors.append(AssertionFileError("assertion_file_schema_invalid", "schema_version"))
 
     raw_cases = document.get("cases")
     if not isinstance(raw_cases, Mapping):
-        errors.append(AssertionFileError("assertion_file_invalid", "cases"))
+        errors.append(AssertionFileError("assertion_file_schema_invalid", "cases"))
         raise errors[0]
     if len(raw_cases) > MAX_ASSERTION_CASES:
-        errors.append(AssertionFileError("assertion_file_invalid", "cases"))
+        errors.append(AssertionFileError("assertion_file_schema_invalid", "cases"))
 
     names = sorted(raw_cases)
     folded_names: set[str] = set()
     valid_names: list[str] = []
     for name in names:
         if not isinstance(name, str) or _CASE_NAME.fullmatch(name) is None:
-            errors.append(AssertionFileError("assertion_file_invalid", "cases"))
+            errors.append(AssertionFileError("assertion_file_schema_invalid", "cases"))
             continue
         folded = name.lower()
         if folded in folded_names:
-            errors.append(AssertionFileError("assertion_file_invalid", f"cases.{name}"))
+            errors.append(AssertionFileError("assertion_file_schema_invalid", f"cases.{name}"))
         else:
             folded_names.add(folded)
         valid_names.append(name)
@@ -287,12 +283,12 @@ def _validate_case(
 ) -> tuple[TraceExpectations | None, list[AssertionFileError]]:
     location = f"cases.{name}"
     if not isinstance(value, Mapping):
-        return None, [AssertionFileError("assertion_file_invalid", location)]
+        return None, [AssertionFileError("assertion_file_schema_invalid", location)]
 
     errors: list[AssertionFileError] = []
     keys = set(value)
     if not keys or keys.difference(_EXPECTATION_FIELDS):
-        errors.append(AssertionFileError("assertion_file_invalid", location))
+        errors.append(AssertionFileError("assertion_file_schema_invalid", location))
 
     values: dict[str, Any] = {}
     for field in _EXPECTATION_FIELDS:
@@ -301,7 +297,7 @@ def _validate_case(
         field_location = f"{location}.{field}"
         raw = value[field]
         if not _valid_field(field, raw):
-            errors.append(AssertionFileError("assertion_file_invalid", field_location))
+            errors.append(AssertionFileError("assertion_file_schema_invalid", field_location))
         else:
             values[field] = raw
 
@@ -309,8 +305,10 @@ def _validate_case(
         return None, errors
 
     expectation = TraceExpectations(**values)
-    if assertions.validate_expectations(expectation):
-        errors.append(AssertionFileError("assertion_file_invalid", location))
+    try:
+        assertions.validate_expectations(expectation)
+    except assertions.ExpectationValidationError:
+        errors.append(AssertionFileError("assertion_file_schema_invalid", location))
         return None, errors
     return expectation, errors
 
