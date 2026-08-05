@@ -158,6 +158,7 @@ def evaluate_run(
 
     artifacts = trace.get("artifacts")
     replacement = trace.get("decode_replacement")
+    timed_out = trace.get("timed_out") is True
     remaining_bytes = MAX_TOTAL_ARTIFACT_BYTES
     stdout_failure, stdout_read = _contains_failure(
         artifacts.get("stdout") if isinstance(artifacts, Mapping) else None,
@@ -165,7 +166,9 @@ def evaluate_run(
         label="stdout",
         expected=validated.stdout_needle,
         remaining_bytes=remaining_bytes,
-        decode_replacement=_decode_replacement_state(replacement, "stdout"),
+        decode_replacement=_decode_replacement_state(
+            replacement, "stdout", timed_out=timed_out
+        ),
     )
     remaining_bytes -= stdout_read
     if stdout_failure is not None:
@@ -177,7 +180,9 @@ def evaluate_run(
         label="stderr",
         expected=validated.stderr_needle,
         remaining_bytes=remaining_bytes,
-        decode_replacement=_decode_replacement_state(replacement, "stderr"),
+        decode_replacement=_decode_replacement_state(
+            replacement, "stderr", timed_out=timed_out
+        ),
     )
     if stderr_failure is not None:
         failures.append(stderr_failure)
@@ -304,9 +309,11 @@ def _contains_failure(
     return AssertionFailure("assertion_mismatch", location), bytes_read
 
 
-def _decode_replacement_state(value: object, label: str) -> str:
+def _decode_replacement_state(
+    value: object, label: str, *, timed_out: bool
+) -> str:
     if value is None:
-        return "unknown"
+        return "unknown" if timed_out else "none"
     if not isinstance(value, Mapping):
         raise AssertionRunError("trace_invalid")
     state = value.get(label)

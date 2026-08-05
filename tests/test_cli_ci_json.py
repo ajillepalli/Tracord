@@ -6,6 +6,7 @@ import site
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,8 +14,9 @@ from tracord import cli
 from tracord.ci_output import serialize_json
 from tracord.recorder import RecordError
 from tracord.replay import ReplayError
-from tracord.run_listing import RunListingError
-from tracord.result_codes import JSON_OUTPUT_FAILURE_EXIT_CODE
+from tracord.assertions import AssertionFailure
+from tracord.run_listing import RunListing, RunListingError
+from tracord.result_codes import ASSERTION_ERROR_CODES, JSON_OUTPUT_FAILURE_EXIT_CODE
 
 
 def _command(entrypoint: str) -> list[str]:
@@ -65,13 +67,14 @@ def test_entrypoints_emit_identical_empty_list_contract(
     assert completed.stderr == b""
 
 
+@pytest.mark.parametrize("entrypoint", ["module", "console"])
 def test_record_list_assert_and_replay_json_are_exact_and_private(
-    tmp_path: Path,
+    entrypoint: str, tmp_path: Path,
 ) -> None:
     store = tmp_path / "private-store"
     secret = "secret-child-output"
     record = _run(
-        "module",
+        entrypoint,
         "record",
         "--store",
         str(store),
@@ -92,7 +95,7 @@ def test_record_list_assert_and_replay_json_are_exact_and_private(
     run_id = payload["run"]["run_id"]
 
     listing = _run(
-        "module", "list", "--store", str(store), "--json", cwd=tmp_path
+        entrypoint, "list", "--store", str(store), "--json", cwd=tmp_path
     )
     list_payload = json.loads(listing.stdout)
     assert listing.returncode == 0
@@ -101,7 +104,7 @@ def test_record_list_assert_and_replay_json_are_exact_and_private(
     assert listing.stderr == b""
 
     asserted = _run(
-        "module",
+        entrypoint,
         "assert",
         "--store",
         str(store),
@@ -117,7 +120,7 @@ def test_record_list_assert_and_replay_json_are_exact_and_private(
     assert asserted.stderr == b""
 
     replayed = _run(
-        "module",
+        entrypoint,
         "replay",
         "--store",
         str(store),
@@ -138,6 +141,9 @@ def test_record_list_assert_and_replay_json_are_exact_and_private(
         ("--json", "list"),
         ("list", "--unknown"),
         ("record", "--json", "--timeout", "not-a-number"),
+        ("replay", "--json", "--git-timeout", "zero", "run-a"),
+        ("assert", "--json", "run-a", "--exit-code", "not-an-int"),
+        ("list", "--json", "--unknown"),
     ],
 )
 def test_argparse_failures_remain_text_stderr(
@@ -158,6 +164,64 @@ def test_parsed_usage_failures_are_json_stdout(tmp_path: Path) -> None:
     assert completed.stdout == serialize_json(payload)
     assert payload["error"] == "record_command_required"
     assert completed.stderr == b""
+
+
+@pytest.mark.parametrize(
+    ("args", "error"),
+    [
+        (("assert", "--json", "run-a"), "assertion_no_expectations"),
+        (("assert", "--json", "../escape", "--status", "passed"), "invalid_run_id"),
+        (("assert", "--json", "run-a", "--file", "cases.json"), "assertion_mode_conflict"),
+        (
+            ("assert", "--json", "run-a", "--case", "case-a", "--status", "passed"),
+            "assertion_mode_conflict",
+        ),
+    ],
+)
+def test_assert_usage_failures_after_parsing_are_json(
+    tmp_path: Path, args: tuple[str, ...], error: str
+) -> None:
+    completed = _run("module", *args, cwd=tmp_path)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 2
+    assert completed.stdout == serialize_json(payload)
+    assert payload["error"] == error
+    assert completed.stderr == b""
+
+
+def test_json_after_record_separator_is_a_child_argument_not_machine_mode(
+    tmp_path: Path,
+) -> None:
+    completed = _run("module", "record", "--", "--json", cwd=tmp_path)
+
+    assert completed.returncode == 1
+    assert completed.stdout == b""
+    assert completed.stderr.startswith(b"tracord: record failed:")
+
+
+@pytest.mark.parametrize(
+    ("run_id", "expected"),
+    [("../private", "invalid_run_id"), ("missing", "run_not_found")],
+)
+def test_inspect_uses_safe_exact_trace_access(
+    tmp_path: Path, run_id: str, expected: str
+) -> None:
+    completed = _run(
+        "module",
+        "inspect",
+        "--store",
+        str(tmp_path / "private-store"),
+        run_id,
+        cwd=tmp_path,
+    )
+
+    assert completed.returncode in {1, 2}
+    assert completed.stdout == b""
+    assert completed.stderr.decode().splitlines() == [
+        f"tracord: inspect failed: {expected}"
+    ]
+    assert str(tmp_path).encode() not in completed.stderr
 
 
 @pytest.mark.parametrize("option", ["--help", "--version"])
@@ -191,6 +255,32 @@ def test_record_runtime_errors_have_fixed_json_mappings(
     assert cli.main(["record", "--json", "--", "child"]) == 1
     captured = capsys.readouterr()
     assert json.loads(captured.out)["error"] == expected
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("target", "argv", "expected"),
+    [
+        ("record_command", ["record", "--json", "--", "child"], "record_failed"),
+        ("scan_runs", ["list", "--json"], "list_failed"),
+        ("replay_run", ["replay", "--json", "run-a"], "replay_failed"),
+    ],
+)
+def test_unexpected_runtime_errors_have_fixed_json_mappings(
+    target: str,
+    argv: list[str],
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("C:/private/secret")
+
+    monkeypatch.setattr(cli, target, fail)
+    assert cli.main(argv) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["error"] == expected
+    assert "private" not in captured.out
     assert captured.err == ""
 
 
@@ -252,6 +342,74 @@ def test_projection_failure_is_distinct_from_child_failure(
     payload = json.loads(capsys.readouterr().out)
     assert payload["error"] == "record_result_invalid"
     assert payload["run"] is None
+
+
+@pytest.mark.parametrize("command", ["list", "replay"])
+def test_list_and_replay_projection_failures_are_fixed(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    if command == "list":
+        monkeypatch.setattr(
+            cli,
+            "scan_runs",
+            lambda _root: RunListing(
+                runs=({"run_id": "unsafe id"},), skipped=0, truncated=False
+            ),
+        )
+        argv = ["list", "--json"]
+    else:
+        monkeypatch.setattr(
+            cli,
+            "replay_run",
+            lambda **_kwargs: {"status": "passed", "run_id": "unsafe id"},
+        )
+        argv = ["replay", "--json", "run-a"]
+
+    assert cli.main(argv) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == f"{command}_result_invalid"
+
+
+@pytest.mark.parametrize("code", sorted(ASSERTION_ERROR_CODES))
+def test_every_assertion_error_code_has_a_fixed_json_mapping(
+    code: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = SimpleNamespace(
+        json_output=True,
+        run_id="run-a",
+        case_name=None,
+        file=None,
+    )
+
+    assert cli._assert_error(code, exit_code=1, args=args) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["error"] == code
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("failures", [[], [AssertionFailure("assertion_mismatch", "status")]])
+def test_assertion_result_construction_failure_has_fixed_fallback(
+    failures: list[AssertionFailure],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "evaluate_run", lambda *_args: ("run-a", failures))
+    original = cli.build_assertion_result
+    calls = 0
+
+    def fail_once(**kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise cli.CIOutputError("invalid")
+        return original(**kwargs)
+
+    monkeypatch.setattr(cli, "build_assertion_result", fail_once)
+    assert cli.main(["assert", "--json", "run-a", "--status", "passed"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "assert_result_invalid"
 
 
 def test_missing_generated_status_is_a_result_failure_not_a_traceback(

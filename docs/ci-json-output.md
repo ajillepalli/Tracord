@@ -71,7 +71,8 @@ name, raw exceptions, or host/store paths.
 claim that an artifact preserves original bytes or identifies a universal
 encoding. Recorded text uses the platform-preferred child-output decoding and
 universal `\n` newlines. Content assertions are indeterminate when replacement
-is `present` or `unknown`.
+is `present` or `unknown`. Legacy completed traces without this metadata infer
+`none`; legacy timeout traces infer `unknown`.
 
 Output run IDs use the ASCII grammar
 `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`. A filesystem-valid imported run with an ID

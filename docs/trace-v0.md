@@ -61,7 +61,8 @@ Current recorders also write:
   identity evidence for the store during publication.
 
 These fields are additive for trace-v0 compatibility. Missing decode metadata is
-treated as `unknown`; missing store identity metadata is treated as unverified.
+treated as `none` for completed legacy traces and `unknown` for legacy timeout
+traces; missing store identity metadata is treated as unverified.
 Decoder replacement does not prove byte integrity or a universal encoding.
 Recorder text normalizes CRLF and CR line endings to LF after decoding.
 

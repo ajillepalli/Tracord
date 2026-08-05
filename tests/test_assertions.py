@@ -116,21 +116,25 @@ def test_scanner_constants_are_frozen():
 
 
 @pytest.mark.parametrize(
-    ("replacement", "expected_code"),
+    ("replacement", "timed_out", "expected_code"),
     [
-        (None, "artifact_decode_unknown"),
-        ("present", "artifact_decode_replaced"),
+        (None, True, "artifact_decode_unknown"),
+        ("present", False, "artifact_decode_replaced"),
     ],
 )
 def test_content_assertions_are_indeterminate_when_decode_provenance_is_lossy_or_unknown(
     tmp_path: Path,
     replacement: str | None,
+    timed_out: bool,
     expected_code: str,
 ):
     root = tmp_path / ".tracord"
     trace, trace_dir = _write_run(root, stdout=b"needle\n")
     if replacement is None:
         trace.pop("decode_replacement")
+        trace["status"] = "timeout"
+        trace["exit_code"] = None
+        trace["timed_out"] = timed_out
     else:
         trace["decode_replacement"] = {"stdout": replacement, "stderr": "none"}
     (trace_dir / "trace.json").write_text(json.dumps(trace), encoding="utf-8")
@@ -138,6 +142,17 @@ def test_content_assertions_are_indeterminate_when_decode_provenance_is_lossy_or
     assert _failures(root, TraceExpectations(stdout_contains="needle")) == [
         AssertionFailure(expected_code, "stdout_contains")
     ]
+
+
+def test_legacy_completed_content_assertion_uses_strict_decode_semantics(
+    tmp_path: Path,
+):
+    root = tmp_path / ".tracord"
+    trace, trace_dir = _write_run(root, stdout=b"needle\n")
+    trace.pop("decode_replacement")
+    (trace_dir / "trace.json").write_text(json.dumps(trace), encoding="utf-8")
+
+    assert _failures(root, TraceExpectations(stdout_contains="needle")) == []
 
 
 def test_snapshot_comparison_is_tri_state_and_nonidentity_first(tmp_path: Path):

@@ -49,13 +49,13 @@ def test_full_run_projection_is_fixed_and_privacy_safe():
     }
 
 
-def test_list_projection_is_smaller_and_legacy_metadata_is_unknown():
+def test_list_projection_is_smaller_and_legacy_completed_metadata_is_none():
     legacy = trace()
     legacy.pop("decode_replacement")
     legacy.pop("store_identity_verified")
     assert project_full_run(legacy)["decode_replacement"] == {
-        "stdout": "unknown",
-        "stderr": "unknown",
+        "stdout": "none",
+        "stderr": "none",
     }
     assert project_full_run(legacy)["store_identity_verified"] is False
     assert set(project_list_run(legacy)) == {
@@ -65,6 +65,16 @@ def test_list_projection_is_smaller_and_legacy_metadata_is_unknown():
         "timed_out",
         "duration_ms",
         "redacted",
+    }
+
+
+def test_legacy_timeout_decode_metadata_is_unknown():
+    legacy_timeout = trace(status="timeout", exit_code=None, timed_out=True)
+    legacy_timeout.pop("decode_replacement")
+
+    assert project_full_run(legacy_timeout)["decode_replacement"] == {
+        "stdout": "unknown",
+        "stderr": "unknown",
     }
 
 

@@ -46,7 +46,8 @@ def project_full_run(trace: Mapping[str, object]) -> dict[str, object]:
     projected = project_list_run(trace)
     replacement = trace.get("decode_replacement")
     if replacement is None:
-        decoded = {"stdout": "unknown", "stderr": "unknown"}
+        legacy_state = "unknown" if trace.get("timed_out") is True else "none"
+        decoded = {"stdout": legacy_state, "stderr": legacy_state}
     elif isinstance(replacement, Mapping):
         stdout = replacement.get("stdout")
         stderr = replacement.get("stderr")

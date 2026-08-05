@@ -21,7 +21,7 @@ from .paths import (
     prepare_regular_file,
     verify_opened_file,
 )
-from .schema import validate_trace
+from .schema import MAX_TRACE_NESTING_DEPTH, validate_trace
 from .storage import PreparedStore, StoreSafetyError, prepare_store_for_read
 
 
@@ -227,6 +227,8 @@ def parse_trace(data: bytes) -> dict[str, object]:
     """Parse strict UTF-8 JSON and enforce the canonical trace schema."""
     try:
         text = data.decode("utf-8", errors="strict")
+        if _json_nesting_exceeded(text):
+            raise ValueError("excessive JSON nesting")
         value = json.loads(
             text,
             object_pairs_hook=_json_object_without_duplicates,
@@ -239,6 +241,31 @@ def parse_trace(data: bytes) -> dict[str, object]:
     if not isinstance(value, dict) or validate_trace(value):
         raise TraceAccessError("trace_invalid")
     return value
+
+
+def _json_nesting_exceeded(text: str) -> bool:
+    """Check container depth before parsing while ignoring quoted delimiters."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAX_TRACE_NESTING_DEPTH:
+                return True
+        elif character in "]}":
+            depth -= 1
+    return False
 
 
 def _store_error_code(reason: str) -> str:

@@ -14,4 +14,3 @@ def schema_resource(name: str):
 def schema_path(name: str) -> Path:
     """Return a filesystem path when package resources are unpacked."""
     return Path(str(schema_resource(name)))
-

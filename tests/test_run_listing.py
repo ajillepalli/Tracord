@@ -9,6 +9,8 @@ import pytest
 from tracord import cli, run_listing
 from tracord.run_listing import RunListing, scan_runs
 from tracord.schema import SCHEMA_VERSION
+from tracord.storage import StoreSafetyError
+from tracord.trace_access import TraceAccessError
 
 
 def _trace(run_id: str, **overrides: object) -> dict[str, object]:
@@ -203,3 +205,66 @@ def test_malformed_or_unsafe_scalars_are_skipped(
     assert listing.runs == ()
     assert listing.skipped == 1
     assert listing.truncated is False
+
+
+def test_store_identity_failures_and_final_replacement_are_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path / "store"
+
+    def unavailable(_root: Path) -> object:
+        raise StoreSafetyError("identity_unverifiable")
+
+    monkeypatch.setattr(run_listing, "prepare_store_for_read", unavailable)
+    with pytest.raises(run_listing.RunListingError) as initial:
+        scan_runs(store)
+    assert initial.value.code == "list_store_unreadable"
+
+    monkeypatch.undo()
+    _write_trace(store, "run-a")
+    monkeypatch.setattr(run_listing, "verify_prepared_store", lambda _store: False)
+    with pytest.raises(run_listing.RunListingError) as final:
+        scan_runs(store)
+    assert final.value.code == "list_store_unreadable"
+
+
+def test_enumeration_failure_is_a_fixed_store_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path / "store"
+    _write_trace(store, "run-a")
+
+    def fail(_path: Path) -> object:
+        raise OSError("private path")
+
+    monkeypatch.setattr(run_listing.os, "scandir", fail)
+    with pytest.raises(run_listing.RunListingError) as exc_info:
+        scan_runs(store)
+    assert exc_info.value.code == "list_store_unreadable"
+    assert str(tmp_path) not in str(exc_info.value)
+
+
+def test_candidate_disappearance_is_skipped_and_overflow_sentinel_is_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path / "store"
+    for run_id in ("run-a", "run-b", "run-c", "run-d"):
+        _write_trace(store, run_id)
+    monkeypatch.setattr(run_listing, "MAX_LIST_CANDIDATES", 2)
+    real_resolve = run_listing.resolve_store_candidate
+    resolved: list[str] = []
+
+    def disappearing(prepared: object, run_id: str) -> object:
+        resolved.append(run_id)
+        if run_id == "run-d":
+            raise TraceAccessError("run_not_found")
+        return real_resolve(prepared, run_id)
+
+    monkeypatch.setattr(run_listing, "resolve_store_candidate", disappearing)
+    listing = scan_runs(store)
+
+    assert resolved == ["run-d", "run-c"]
+    assert [trace["run_id"] for trace in listing.runs] == ["run-c"]
+    assert "run-b" not in resolved
+    assert listing.skipped == 1
+    assert listing.truncated is True
