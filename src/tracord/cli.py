@@ -50,10 +50,14 @@ def console_main(argv: list[str] | None = None) -> int:
             exit_code = main(argv)
         except SystemExit as exc:
             exit_code = _system_exit_code(exc.code)
+    except BrokenPipeError:
+        _silence_broken_standard_streams()
+        return JSON_OUTPUT_FAILURE_EXIT_CODE
+    try:
         sys.stdout.flush()
         sys.stderr.flush()
         return exit_code
-    except (BrokenPipeError, OSError):
+    except OSError:
         _silence_broken_standard_streams()
         return JSON_OUTPUT_FAILURE_EXIT_CODE
 
@@ -63,6 +67,7 @@ def _system_exit_code(code: object) -> int:
         return 0
     if isinstance(code, int):
         return code
+    print(code, file=sys.stderr)
     return 1
 
 

@@ -2,6 +2,7 @@ import argparse
 import os
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,37 @@ def test_console_main_maps_broken_pipe_to_transport_exit(monkeypatch):
     assert console_main([]) == JSON_OUTPUT_FAILURE_EXIT_CODE
 
 
+def test_console_main_preserves_normal_and_argparse_exit_codes(monkeypatch):
+    monkeypatch.setattr("tracord.cli.main", lambda _argv: 7)
+    assert console_main([]) == 7
+
+    def parser_exit(_argv):
+        raise SystemExit(2)
+
+    monkeypatch.setattr("tracord.cli.main", parser_exit)
+    assert console_main([]) == 2
+
+
+def test_console_main_preserves_system_exit_message(monkeypatch, capsys):
+    def message_exit(_argv):
+        raise SystemExit("usage failed")
+
+    monkeypatch.setattr("tracord.cli.main", message_exit)
+
+    assert console_main([]) == 1
+    assert capsys.readouterr().err == "usage failed\n"
+
+
+def test_console_main_does_not_swallow_command_oserror(monkeypatch):
+    def command_failure(_argv):
+        raise PermissionError("store denied")
+
+    monkeypatch.setattr("tracord.cli.main", command_failure)
+
+    with pytest.raises(PermissionError, match="store denied"):
+        console_main([])
+
+
 @pytest.mark.parametrize("entrypoint", ["module", "console"])
 def test_process_entrypoints_suppress_broken_pipe_diagnostics(
     entrypoint: str, tmp_path: Path
@@ -55,7 +87,8 @@ def test_process_entrypoints_suppress_broken_pipe_diagnostics(
         if entrypoint == "module"
         else [
             str(
-                Path(sys.executable).with_name(
+                Path(sysconfig.get_path("scripts"))
+                / (
                     "tracord.exe" if os.name == "nt" else "tracord"
                 )
             ),
