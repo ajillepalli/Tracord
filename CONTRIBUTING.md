@@ -80,7 +80,7 @@ src/tracord/              # CLI and core recording code
   assertions.py           # deterministic assertion evaluation
   bundle.py               # portable .tracord.zip import/export
   replay.py               # command replay
-  redaction.py            # best-effort output redaction
+  redaction.py            # named redaction rules and count-only summaries
   paths.py                # safe relative path handling
   git_capture.py          # isolated Git before/after snapshots
 tests/                    # unit tests

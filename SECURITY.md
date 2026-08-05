@@ -18,11 +18,19 @@ Useful reports include:
 
 - Default to local storage.
 - Redact obvious secrets before exporting traces.
+- Treat redaction summaries as best-effort signals, not proof that content is safe to share.
 - Treat shell commands, network destinations, file paths, file diffs, prompts, and tool inputs as sensitive data.
 - Avoid sending trace data to hosted services unless a user explicitly opts in.
 - Make unsafe or destructive tool activity visible in the trace.
 - Reject archive paths that are absolute, contain parent traversal, use Windows drives, or use backslashes.
 - Treat replay as execution of untrusted historical instructions unless the run is known and reviewed.
+
+Redaction summaries expose rule names and counts only. They do not include matched
+values, offsets, lengths, or excerpts. Named assignments containing an
+already-redacted placeholder are reported separately from live findings;
+placeholders produced by full-match rules cannot be attributed afterward. Broad
+encoded-secret candidates are advisory to avoid treating common repository
+identifiers as confirmed secrets.
 
 ## Scope
 
