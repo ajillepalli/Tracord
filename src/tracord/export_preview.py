@@ -87,7 +87,9 @@ def preview_export(
 
     try:
         trace = json.loads(trace_result.data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+    except RecursionError:
+        raise ExportPreviewError("invalid_trace") from None
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise ExportPreviewError("invalid_trace_json") from None
     if not isinstance(trace, dict) or validate_trace(trace):
         raise ExportPreviewError("invalid_trace")
