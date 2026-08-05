@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and this project will follow semantic v
 
 ## [Unreleased]
 
+## [0.1.0.0] - 2026-08-05
+
 - Created initial repository scaffold.
 - Added minimal Python CLI for recording, listing, and inspecting local command runs.
 - Documented `tracord.trace.v0` and added deterministic trace assertions.
@@ -22,3 +24,4 @@ The format is based on Keep a Changelog, and this project will follow semantic v
 - Made legacy timeout content assertions indeterminate when decode replacement provenance is unknown.
 - Bounded text and JSON list output together at 1,000 runs with explicit incompleteness diagnostics.
 - Added protocol-neutral tool-call start/finish events with explicit capture states, lifecycle validation, privacy-safe diagnostics, and JSON Schema coverage.
+- Added a byte-transparent MCP stdio proxy with bounded tool-call observation, explicit capture policies, atomic trace publication, and cross-platform process-tree cleanup.
