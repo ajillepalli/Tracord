@@ -58,13 +58,13 @@ jobs:
               wheel_schemas = {
                   Path(name).name
                   for name in archive.namelist()
-                  if "/schemas/" in name
+                  if Path(name).parts[:2] == ("tracord", "schemas")
               }
           with tarfile.open(sdist) as archive:
               sdist_schemas = {
                   Path(name).name
                   for name in archive.getnames()
-                  if "/schemas/" in name
+                  if Path(name).parts[1:4] == ("src", "tracord", "schemas")
               }
-          assert expected <= wheel_schemas
-          assert expected <= sdist_schemas
+          assert wheel_schemas == expected
+          assert sdist_schemas == expected

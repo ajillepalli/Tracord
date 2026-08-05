@@ -36,7 +36,11 @@ The output/exit rules are:
 | Parsed JSON handler outcome | One JSON object plus LF | Empty | Result-specific `0`, `1`, or `2` |
 | Argparse failure | Empty | Text usage/error | `2` |
 | `--help` or `--version` | Text | Empty | `0` |
-| JSON stdout write or flush failure | May be partial or empty | No fallback JSON or traceback | `4` |
+| Standard-stream write or flush failure | May be complete, partial, or empty | No fallback JSON or traceback | `4` |
+
+Exit `4` supersedes any payload result. A late process-level flush failure can
+occur after a complete object was written, so consumers must treat that object
+as unconfirmed when the observed process exit is `4`.
 
 Consumers must know they invoked a parsed handler with `--json`. Do not infer
 JSON mode merely because stdout is nonempty: help and version output are text.
@@ -100,6 +104,10 @@ unprocessed because an output, candidate, or aggregate limit was reached. A
 declared file larger than 16 MiB is skipped before the aggregate budget is
 charged. The overflow sentinel is never opened and does not increment
 `skipped`.
+
+All entries under `runs/` are considered, including stray files and dotfiles;
+unsafe or non-run debris increments `skipped` so it cannot silently weaken the
+completeness oracle.
 
 `list --json` is a completeness oracle only when `skipped == 0` and
 `truncated == false`. Directory enumeration is not a transactional filesystem

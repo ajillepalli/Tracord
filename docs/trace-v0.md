@@ -35,6 +35,10 @@ The initial command recorder emits:
 
 Future event types should be additive and should not require changing the top-level trace shape.
 
+Safe trace readers reject JSON with more than 256 simultaneously open
+containers, including the root. This canonical bound applies to list, inspect,
+replay, and assertions.
+
 ## Artifacts
 
 Artifact paths are relative to the directory containing `trace.json`. v0 command traces write:

@@ -84,9 +84,9 @@ aggregate limits. A match in verified covered bytes satisfies its field, while
 an uncovered negative result is `scan_incomplete`; a match never bypasses
 identity or snapshot verification.
 
-The CLI keeps result classes stable: `0` passes, `1` represents trace or
-expectation failure, and `2` represents invocation, assertion-file, value, or
-case-selection errors. Public diagnostics are closed fixed codes and never
+The CLI keeps result classes stable: `0` passes; `1` represents trace,
+expectation, evaluation, or internal failure; and `2` represents recognized
+invocation, assertion-file, value, or case-selection errors. Public diagnostics are closed fixed codes and never
 include untrusted IDs, paths, values, content, or raw exceptions.
 
 Assertions now share exact directory resolution, descriptor-bounded trace reads,

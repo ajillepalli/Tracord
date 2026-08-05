@@ -14,15 +14,9 @@ COMMAND_RECORD = "record"
 COMMAND_REPLAY = "replay"
 COMMAND_ASSERT = "assert"
 COMMAND_LIST = "list"
-RESULT_COMMANDS = frozenset(
-    {COMMAND_RECORD, COMMAND_REPLAY, COMMAND_ASSERT, COMMAND_LIST}
-)
-
 MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
 MIN_PROCESS_EXIT_CODE = -(2**31)
 MAX_PROCESS_EXIT_CODE = (2**32) - 1
-MAX_TRACE_JSON_NESTING = 256
-
 CI_RUN_ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 CI_RUN_ID_SCHEMA_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?![\s\S])"
 CI_RUN_ID = re.compile(CI_RUN_ID_PATTERN, re.ASCII)
@@ -132,28 +126,6 @@ ASSERTION_FAILURE_KINDS = frozenset({"mismatch", "indeterminate"})
 ASSERTION_OUTCOMES = frozenset({"pass", "mismatch", "indeterminate", "error"})
 
 TRACE_STATUSES = frozenset({"passed", "failed", "timeout"})
-FILE_CHANGE_STATUSES = frozenset(
-    {"captured", "unchanged", "skipped", "omitted", "error"}
-)
-FILE_CHANGE_REASONS = frozenset(
-    {
-        "git_unavailable",
-        "repository_discovery_failed",
-        "not_git_repository",
-        "git_common_dir_failed",
-        "store_contains_repository",
-        "before_snapshot_failed",
-        "capture_not_started",
-        "diff_summary_timeout",
-        "summary_size_limit",
-        "diff_summary_failed",
-        "after_snapshot_failed",
-        "diff_generation_timeout",
-        "size_limit",
-        "diff_generation_failed",
-        "size_limit_after_redaction",
-    }
-)
 DECODE_REPLACEMENT_STATES = frozenset({"none", "present", "unknown"})
 
 JSON_OUTPUT_FAILURE_EXIT_CODE = 4

@@ -87,12 +87,12 @@ def test_process_entrypoints_suppress_broken_pipe_diagnostics(
         "tracord.exe" if os.name == "nt" else "tracord"
     )
     if not console_path.exists():
-        console_path = (
-            Path(site.getuserbase())
-            / f"Python{sys.version_info.major}{sys.version_info.minor}"
-            / "Scripts"
-            / ("tracord.exe" if os.name == "nt" else "tracord")
+        console_path = Path(site.getuserbase()) / (
+            f"Python{sys.version_info.major}{sys.version_info.minor}/Scripts/tracord.exe"
+            if os.name == "nt"
+            else "bin/tracord"
         )
+    assert console_path.is_file(), "installed tracord console entry point is unavailable"
     command = (
         [sys.executable, "-m", "tracord", "--version"]
         if entrypoint == "module"

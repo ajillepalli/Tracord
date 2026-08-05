@@ -5,6 +5,7 @@ import os
 import site
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,15 +24,20 @@ def _command(entrypoint: str) -> list[str]:
     if entrypoint == "module":
         return [sys.executable, "-m", "tracord"]
     suffix = ".exe" if os.name == "nt" else ""
-    user_script = (
-        Path(site.getuserbase())
-        / f"Python{sys.version_info.major}{sys.version_info.minor}"
-        / "Scripts"
-        / f"tracord{suffix}"
-    )
-    if user_script.exists():
-        return [str(user_script)]
-    pytest.skip("installed console entry point is unavailable")
+    candidates = [Path(sysconfig.get_path("scripts")) / f"tracord{suffix}"]
+    if os.name == "nt":
+        candidates.append(
+            Path(site.getuserbase())
+            / f"Python{sys.version_info.major}{sys.version_info.minor}"
+            / "Scripts"
+            / f"tracord{suffix}"
+        )
+    else:
+        candidates.append(Path(site.getuserbase()) / "bin" / "tracord")
+    for candidate in candidates:
+        if candidate.is_file():
+            return [str(candidate)]
+    raise AssertionError("installed tracord console entry point is unavailable")
 
 
 def _run(entrypoint: str, *args: str, cwd: Path) -> subprocess.CompletedProcess[bytes]:

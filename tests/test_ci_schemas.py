@@ -11,7 +11,9 @@ from tracord.ci_output import (
 )
 from tracord.result_codes import (
     ASSERTION_ERROR_CODES,
+    ASSERTION_ERROR_LOCATION_SCHEMA_PATTERN,
     ASSERTION_FAILURE_CODES,
+    CI_RUN_ID_SCHEMA_PATTERN,
     LIST_ERROR_CODES,
     MAX_PROCESS_EXIT_CODE,
     MAX_SAFE_JSON_INTEGER,
@@ -101,6 +103,21 @@ def test_schema_error_vocabularies_equal_leaf_owned_sets():
     assert set(
         load_schema("assert")["$defs"]["failure"]["properties"]["code"]["enum"]
     ) == set(ASSERTION_FAILURE_CODES)
+
+
+def test_schema_patterns_equal_leaf_owned_patterns():
+    assert load_schema("record")["$defs"]["runId"]["pattern"] == CI_RUN_ID_SCHEMA_PATTERN
+    assert load_schema("replay")["$defs"]["runId"]["pattern"] == CI_RUN_ID_SCHEMA_PATTERN
+    assert (
+        load_schema("list")["$defs"]["listRun"]["properties"]["run_id"]["pattern"]
+        == CI_RUN_ID_SCHEMA_PATTERN
+    )
+    assertion = load_schema("assert")
+    assert assertion["$defs"]["id"]["pattern"] == CI_RUN_ID_SCHEMA_PATTERN
+    assert (
+        assertion["properties"]["error_location"]["pattern"]
+        == ASSERTION_ERROR_LOCATION_SCHEMA_PATTERN
+    )
 
 
 @pytest.mark.parametrize("command", SCHEMA_NAMES)

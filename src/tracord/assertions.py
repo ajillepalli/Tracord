@@ -35,6 +35,8 @@ MAX_TOTAL_ARTIFACT_BYTES = 16 * 1024 * 1024
 READ_CHUNK_BYTES = 1024 * 1024
 MAX_NEEDLE_BYTES = 65_536
 TAIL_BYTES = MAX_NEEDLE_BYTES - 1
+
+
 class ExpectationValidationError(ValueError):
     """A fixed-code expectation construction error."""
 

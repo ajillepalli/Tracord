@@ -74,9 +74,6 @@ def scan_runs(root: Path) -> RunListing:
     aggregate_attempted = 0
 
     for index, run_id in enumerate(retained):
-        if len(runs) == MAX_LIST_RUNS:
-            truncated = True
-            break
         try:
             run = resolve_store_candidate(store, run_id)
             loaded = read_trace(

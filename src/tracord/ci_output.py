@@ -266,12 +266,6 @@ def serialize_json(payload: Mapping[str, object]) -> bytes:
     return encoded + b"\n"
 
 
-def write_json_stdout(payload: Mapping[str, object]) -> None:
-    """Write deterministic JSON through the current stdout object."""
-    if not JsonEmitter().emit(payload):
-        raise OSError("stdout emission failed")
-
-
 class JsonEmitter:
     """Attempt at most one guarded result emission."""
 
