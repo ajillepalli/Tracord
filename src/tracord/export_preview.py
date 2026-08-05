@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import stat
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from .bundle import (
@@ -20,7 +19,15 @@ from .bundle import (
     build_manifest,
     validate_run_id,
 )
-from .paths import is_link_or_junction, validate_relative_path
+from .paths import (
+    IdentityComparison,
+    SafePathError,
+    is_link_or_junction,
+    open_prepared_file,
+    prepare_regular_file,
+    validate_relative_path,
+    verify_opened_file,
+)
 from .redaction import (
     REDACTION,
     RedactionSummary,
@@ -257,6 +264,12 @@ def gate_reasons(
         reasons.append("gating_findings")
     if preview.get("export_would_succeed") is not True:
         reasons.append("export_blocked")
+    files = preview.get("files", [])
+    if isinstance(files, list) and any(
+        isinstance(file, dict) and file.get("identity_verified") is False
+        for file in files
+    ):
+        reasons.append("identity_unverified")
     if (
         isinstance(scan, dict)
         and scan.get("complete") is not True
@@ -335,72 +348,20 @@ def _scan_file(
         )
 
     display_path = sanitize_label(relative_path)
-    candidate = source_dir.joinpath(*PurePosixPath(relative_path).parts)
-    containment = _check_containment(source_dir, candidate)
-    if containment is not None:
-        return _ScanResult(
-            _empty_file_payload(
-                file_id=file_id,
-                path=display_path,
-                status="unsafe_path",
-                reason=containment,
-            )
-        )
-
-    parent_reason = _check_parent_components(source_dir, relative_path)
-    if parent_reason is not None:
-        return _ScanResult(
-            _empty_file_payload(
-                file_id=file_id,
-                path=display_path,
-                status="unreadable",
-                reason=parent_reason,
-            )
-        )
-
     try:
-        initial = candidate.lstat()
-    except FileNotFoundError:
+        prepared = prepare_regular_file(source_dir, relative_path)
+    except SafePathError as exc:
+        status, reason = _preview_prepare_failure(exc.reason)
         return _ScanResult(
             _empty_file_payload(
                 file_id=file_id,
                 path=display_path,
-                status="missing",
-                reason="missing",
-            )
-        )
-    except OSError:
-        return _ScanResult(
-            _empty_file_payload(
-                file_id=file_id,
-                path=display_path,
-                status="unreadable",
-                reason="stat_failed",
+                status=status,
+                reason=reason,
             )
         )
 
-    size = initial.st_size
-    if is_link_or_junction(candidate, initial):
-        return _ScanResult(
-            _empty_file_payload(
-                file_id=file_id,
-                path=display_path,
-                status="unreadable",
-                reason="symlink",
-                size_bytes=None,
-            )
-        )
-    if not stat.S_ISREG(initial.st_mode):
-        return _ScanResult(
-            _empty_file_payload(
-                file_id=file_id,
-                path=display_path,
-                status="unreadable",
-                reason="not_regular_file",
-                size_bytes=size,
-            )
-        )
-    identity_unavailable = initial.st_ino == 0
+    size = prepared.initial.st_size
     if remaining_bytes <= 0:
         return _ScanResult(
             _empty_file_payload(
@@ -413,37 +374,39 @@ def _scan_file(
         )
 
     read_limit = min(size, max_scan_bytes, remaining_bytes)
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(candidate, flags)
-    except OSError:
+        opened = open_prepared_file(prepared)
+    except SafePathError as exc:
+        opened_but_changed = exc.reason == "changed"
         return _ScanResult(
             _empty_file_payload(
                 file_id=file_id,
                 path=display_path,
                 status="unreadable",
-                reason="open_failed",
+                reason="changed_during_scan" if exc.reason == "changed" else "open_failed",
                 size_bytes=size,
+                identity_verified=False if opened_but_changed else None,
             )
         )
 
+    data = b""
     try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or not _same_identity(initial, opened):
-            return _ScanResult(
-                _empty_file_payload(
-                    file_id=file_id,
-                    path=display_path,
-                    status="unreadable",
-                    reason="changed_during_scan",
-                    size_bytes=size,
-                )
-            )
-        stream = os.fdopen(descriptor, "rb", closefd=True)
-        descriptor = -1
-        with stream:
-            data = stream.read(read_limit)
-            final_descriptor = os.fstat(stream.fileno())
+        with opened:
+            data, short_read = _read_scan_bytes(opened.stream, read_limit)
+            identity = verify_opened_file(opened)
+    except SafePathError as exc:
+        reason = "changed_during_scan" if exc.reason == "changed" else "read_failed"
+        return _ScanResult(
+            _empty_file_payload(
+                file_id=file_id,
+                path=display_path,
+                status="unreadable",
+                reason=reason,
+                size_bytes=size,
+                identity_verified=False,
+            ),
+            bytes_read=len(data),
+        )
     except OSError:
         return _ScanResult(
             _empty_file_payload(
@@ -452,39 +415,20 @@ def _scan_file(
                 status="unreadable",
                 reason="read_failed",
                 size_bytes=size,
-            )
-        )
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-    if (
-        not _same_snapshot(initial, final_descriptor)
-        or len(data) != read_limit
-        or _check_containment(source_dir, candidate) is not None
-    ):
-        return _ScanResult(
-            _empty_file_payload(
-                file_id=file_id,
-                path=display_path,
-                status="unreadable",
-                reason="changed_during_scan",
-                size_bytes=size,
+                identity_verified=False,
             ),
             bytes_read=len(data),
         )
-    try:
-        final_path = candidate.lstat()
-    except OSError:
-        final_path = None
-    if final_path is None or not _same_snapshot(initial, final_path):
+
+    if short_read:
         return _ScanResult(
             _empty_file_payload(
                 file_id=file_id,
                 path=display_path,
                 status="unreadable",
-                reason="changed_during_scan",
+                reason="read_failed",
                 size_bytes=size,
+                identity_verified=identity is IdentityComparison.VERIFIED,
             ),
             bytes_read=len(data),
         )
@@ -497,6 +441,7 @@ def _scan_file(
                 status="skipped_binary",
                 reason="binary_content",
                 size_bytes=size,
+                identity_verified=identity is IdentityComparison.VERIFIED,
             ),
             bytes_read=len(data),
         )
@@ -506,9 +451,6 @@ def _scan_file(
     if size > read_limit:
         status = "truncated" if read_limit == max_scan_bytes else "aggregate_limit"
         reason = "aggregate_limit" if status == "aggregate_limit" else "max_scan_bytes"
-    elif identity_unavailable:
-        status = "identity_unverified"
-        reason = "identity_unavailable"
     else:
         status = "scanned"
         reason = None
@@ -520,8 +462,35 @@ def _scan_file(
         size_bytes=size,
         scanned_bytes=len(data),
         summary=summary,
+        identity_verified=identity is IdentityComparison.VERIFIED,
     )
     return _ScanResult(payload, summary=summary, data=data, bytes_read=len(data))
+
+
+def _preview_prepare_failure(reason: str) -> tuple[str, str]:
+    if reason in {"invalid_relative_path", "path_escape"}:
+        return "unsafe_path", reason
+    if reason == "missing":
+        return "missing", "missing"
+    if reason == "parent_stat_failed":
+        return "unreadable", "stat_failed"
+    return "unreadable", reason
+
+
+def _read_scan_bytes(stream: object, limit: int) -> tuple[bytes, bool]:
+    chunks: list[bytes] = []
+    bytes_read = 0
+    while bytes_read < limit:
+        requested = limit - bytes_read
+        chunk = stream.read(requested)
+        if not chunk:
+            return b"".join(chunks), True
+        if len(chunk) > requested:
+            chunks.append(chunk[:requested])
+            return b"".join(chunks), True
+        chunks.append(chunk)
+        bytes_read += len(chunk)
+    return b"".join(chunks), False
 
 
 def _validate_run_directory(root: Path, source_dir: Path) -> None:
@@ -606,48 +575,6 @@ def _combine_summaries(summaries: list[RedactionSummary]) -> RedactionSummary:
     )
 
 
-def _check_containment(source_dir: Path, candidate: Path) -> str | None:
-    try:
-        root = source_dir.resolve(strict=False)
-        target = candidate.resolve(strict=False)
-        target.relative_to(root)
-    except (OSError, ValueError):
-        return "path_escape"
-    return None
-
-
-def _check_parent_components(source_dir: Path, relative_path: str) -> str | None:
-    current = source_dir
-    for part in PurePosixPath(relative_path).parts[:-1]:
-        current /= part
-        try:
-            info = current.lstat()
-        except FileNotFoundError:
-            return "missing_parent"
-        except OSError:
-            return "stat_failed"
-        if is_link_or_junction(current, info):
-            return "symlink_parent"
-        if not stat.S_ISDIR(info.st_mode):
-            return "parent_not_directory"
-    return None
-
-
-def _same_identity(first: os.stat_result, second: os.stat_result) -> bool:
-    if first.st_ino == 0 or second.st_ino == 0:
-        return True
-    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
-
-
-def _same_snapshot(first: os.stat_result, second: os.stat_result) -> bool:
-    return (
-        _same_identity(first, second)
-        and first.st_mode == second.st_mode
-        and first.st_size == second.st_size
-        and first.st_mtime_ns == second.st_mtime_ns
-    )
-
-
 def _file_payload(
     *,
     file_id: str,
@@ -657,6 +584,7 @@ def _file_payload(
     size_bytes: int | None,
     scanned_bytes: int,
     summary: RedactionSummary,
+    identity_verified: bool | None = None,
 ) -> dict[str, Any]:
     payload = {
         "id": file_id,
@@ -666,6 +594,8 @@ def _file_payload(
         "scanned_bytes": scanned_bytes,
         "findings": _summary_payload(summary),
     }
+    if identity_verified is not None:
+        payload["identity_verified"] = identity_verified
     if reason is not None:
         payload["reason"] = reason
     return payload
@@ -679,6 +609,7 @@ def _empty_file_payload(
     reason: str,
     size_bytes: int | None = None,
     omitted_files: int | None = None,
+    identity_verified: bool | None = None,
 ) -> dict[str, Any]:
     payload = {
         "id": file_id,
@@ -689,6 +620,8 @@ def _empty_file_payload(
         "findings": _empty_findings(),
         "reason": reason,
     }
+    if identity_verified is not None:
+        payload["identity_verified"] = identity_verified
     if omitted_files is not None:
         payload["omitted_files"] = omitted_files
     return payload
