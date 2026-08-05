@@ -454,7 +454,9 @@ def test_export_falls_back_when_hardlinks_are_unsupported(tmp_path: Path, monkey
         assert archive.getinfo("trace.json").file_size > 0
 
 
-@pytest.mark.parametrize("run_id", ["stream:name", "trailing.", "NUL"])
+@pytest.mark.parametrize(
+    "run_id", ["stream:name", "trailing.", "NUL", ".tracord-reserved.lock"]
+)
 def test_import_rejects_nonportable_run_ids(tmp_path: Path, run_id: str):
     source = tmp_path / "source"
     trace = record_command([sys.executable, "-c", "print('safe')"], root=source)
@@ -827,6 +829,32 @@ def test_import_rejects_hardlinked_lock_without_touching_target(tmp_path: Path):
         import_bundle(root=tmp_path / "target", bundle_path=bundle)
 
     assert external.read_bytes() == b"preserve"
+
+
+def test_import_rejects_directory_at_lock_path_with_fixed_error(tmp_path: Path):
+    source = tmp_path / "source"
+    trace = record_command([sys.executable, "-c", "print('safe')"], root=source)
+    bundle = export_run(
+        root=source,
+        run_id=str(trace["run_id"]),
+        output_path=tmp_path / "run.zip",
+    )
+    target_dir = run_dir(tmp_path / "target", str(trace["run_id"]))
+    target_dir.parent.mkdir(parents=True)
+    bundle_module._import_lock_path(target_dir).mkdir()
+
+    with pytest.raises(ValueError, match="lock file is unsafe"):
+        import_bundle(root=tmp_path / "target", bundle_path=bundle)
+
+
+def test_empty_existing_lock_is_reported_as_contention(tmp_path: Path):
+    target_dir = tmp_path / "runs" / "run-id"
+    target_dir.parent.mkdir(parents=True)
+    lock_path = bundle_module._import_lock_path(target_dir)
+    lock_path.touch()
+
+    with pytest.raises(ValueError, match="already in progress"):
+        bundle_module._open_import_lock(lock_path)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows prevents renaming an open lock")

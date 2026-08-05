@@ -237,7 +237,9 @@ def test_invalid_cli_scan_limit_is_usage_error_with_json(tmp_path: Path, capsys)
     assert json.loads(captured.out)["error"] == "invalid_scan_limit"
 
 
-@pytest.mark.parametrize("run_id", [".", "stream:name", "trailing.", "NUL"])
+@pytest.mark.parametrize(
+    "run_id", [".", "stream:name", "trailing.", "NUL", ".tracord-reserved.lock"]
+)
 def test_invalid_run_id_is_usage_error_with_json(tmp_path: Path, capsys, run_id: str):
     exit_code = main(["export", "--preview", "--json", run_id])
     captured = capsys.readouterr()

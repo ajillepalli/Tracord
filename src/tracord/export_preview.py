@@ -310,10 +310,10 @@ def _artifact_names(
         if not isinstance(value, str) or value == TRACE_FILE or value in seen:
             continue
         if len(names) >= max_artifacts:
-            return sorted(names), True, namespace_invalid
+            return names, True, namespace_invalid
         seen.add(value)
         names.append(value)
-    return sorted(names), False, namespace_invalid
+    return names, False, namespace_invalid
 
 
 def _scan_file(

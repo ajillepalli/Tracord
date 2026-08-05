@@ -297,6 +297,8 @@ def validate_run_id(run_id: str) -> None:
     errors = validate_relative_path(run_id)
     if errors or "/" in run_id:
         raise ValueError("invalid run id: " + "; ".join(errors or ["must be one path segment"]))
+    if run_id.casefold().startswith(".tracord-"):
+        raise ValueError("invalid run id: reserved for Tracord transaction files")
     try:
         _portable_path_key(run_id)
     except ValueError:
@@ -551,24 +553,29 @@ def _open_import_lock(lock_path: Path) -> int:
         )
         created = True
         initial = os.fstat(descriptor)
-    except FileExistsError:
+    except OSError:
         try:
             initial = lock_path.lstat()
         except OSError:
             raise ValueError("import lock file is unsafe") from None
         if is_link_or_junction(lock_path, initial):
             raise ValueError("import lock file is unsafe")
-        descriptor = os.open(lock_path, os.O_RDWR | binary | no_follow)
+        try:
+            descriptor = os.open(lock_path, os.O_RDWR | binary | no_follow)
+        except OSError:
+            raise ValueError("import lock file is unsafe") from None
 
     try:
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
             or opened.st_nlink != 1
-            or (not created and opened.st_size != 1)
+            or (not created and opened.st_size not in {0, 1})
             or not _same_export_snapshot(initial, opened)
         ):
             raise ValueError("import lock file is unsafe")
+        if not created and opened.st_size == 0:
+            raise ValueError("import already in progress for this run")
         if created:
             if os.write(descriptor, b"\0") != 1:
                 raise OSError("short import lock write")
