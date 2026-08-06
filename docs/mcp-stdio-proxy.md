@@ -71,6 +71,14 @@ finalization path. An independently observed child failure is returned to the
 client. Cleanup initiated after client disconnect does not invent a child
 failure, but observation is marked incomplete.
 
+On Windows, Tracord creates the server with its primary thread suspended. It
+assigns the process to a kill-on-close Job Object, verifies membership, and
+resumes the sole initial thread only after both checks succeed. If Job setup,
+thread discovery, or resume support is unavailable or returns an unexpected
+state, launch fails closed with `mcp_spawn_failed`; server code is not allowed
+to run outside the Job. POSIX servers continue to start in a new session and
+verified process group.
+
 The trace's top-level `exit_code` is the Tracord proxy process result so failed
 runs remain valid list entries. The server's unmodified result is retained as
 `mcp_proxy.raw_child_exit_code`.

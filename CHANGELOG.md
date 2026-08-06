@@ -6,6 +6,11 @@ The format is based on Keep a Changelog, and this project will follow semantic v
 
 ## [Unreleased]
 
+## [0.1.1.0] - 2026-08-05
+
+- Closed the Windows MCP server spawn-to-Job race by assigning and verifying
+  suspended children before their initial thread can run.
+
 ## [0.1.0] - 2026-08-05
 
 - Created initial repository scaffold.

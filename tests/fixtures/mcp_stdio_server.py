@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -29,6 +30,26 @@ if MODE == "server-request":
 if MODE == "spawn-descendant":
     subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     raise SystemExit(int(sys.argv[2]) if len(sys.argv) > 2 else 0)
+
+if MODE == "spawn-descendant-pid":
+    pid_path = sys.argv[2]
+    subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os,sys,time; temporary = sys.argv[1] + '.tmp'; "
+            "open(temporary, 'w', encoding='ascii').write(str(os.getpid())); "
+            "os.replace(temporary, sys.argv[1]); "
+            "time.sleep(60)",
+            pid_path,
+        ]
+    )
+    deadline = time.monotonic() + 2
+    while not os.path.exists(pid_path) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not os.path.exists(pid_path):
+        raise SystemExit(9)
+    raise SystemExit(0)
 
 if MODE == "flood":
     for _index in range(256):

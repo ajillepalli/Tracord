@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import signal
@@ -19,6 +20,16 @@ from tracord.schema import validate_trace
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mcp_stdio_server.py"
+
+
+class _FakeWinFunction:
+    def __init__(self, implementation: object) -> None:
+        self.implementation = implementation
+        self.restype: object = None
+        self.argtypes: object = None
+
+    def __call__(self, *args: object) -> object:
+        return self.implementation(*args)  # type: ignore[operator]
 
 
 def message(request_id: object, method: str, params: dict[str, object]) -> bytes:
@@ -682,6 +693,380 @@ def test_non_exiting_descendant_is_cleaned_up(tmp_path: Path) -> None:
     assert trace["mcp_proxy"]["proxy_initiated_cleanup"] is True
     assert trace["mcp_proxy"]["shutdown_reason"] == "descendant_grace_expired"
     assert "descendant_cleanup" in trace["mcp_proxy"]["observation"]["reasons"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job launch semantics")
+def test_immediate_windows_descendant_starts_in_job_and_is_cleaned_up(
+    tmp_path: Path,
+) -> None:
+    pid_path = tmp_path / "descendant.pid"
+    completed, trace, _run_dir = run_proxy(
+        tmp_path,
+        b"",
+        fixture_args=("spawn-descendant-pid", str(pid_path)),
+    )
+
+    assert completed.returncode == 0
+    assert trace["mcp_proxy"]["shutdown_reason"] == "descendant_grace_expired"
+    descendant_pid = int(pid_path.read_text(encoding="ascii"))
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    process_handle = kernel32.OpenProcess(0x1000, False, descendant_pid)
+    if process_handle:
+        try:
+            exit_code = ctypes.c_uint32()
+            assert kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code))
+            assert exit_code.value != 259
+        finally:
+            kernel32.CloseHandle(process_handle)
+    else:
+        assert ctypes.get_last_error() == 87
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job launch semantics")
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("create", []),
+        ("configure", ["close_job"]),
+        ("assign", ["terminate_process", "close_job"]),
+        ("verify", ["terminate_process", "close_job"]),
+        ("membership", ["terminate_process", "close_job"]),
+    ],
+)
+def test_windows_job_setup_failures_terminate_suspended_process_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    expected: list[str],
+) -> None:
+    calls: list[str] = []
+
+    def create_job(*_args: object) -> int:
+        if failure == "create":
+            ctypes.set_last_error(5)
+            return 0
+        return 101
+
+    def configure(*_args: object) -> int:
+        if failure == "configure":
+            ctypes.set_last_error(5)
+            return 0
+        return 1
+
+    def assign(*_args: object) -> int:
+        if failure == "assign":
+            ctypes.set_last_error(5)
+            return 0
+        return 1
+
+    def verify(_process: object, _job: object, result: object) -> int:
+        if failure == "verify":
+            ctypes.set_last_error(5)
+            return 0
+        result._obj.value = 0 if failure == "membership" else 1  # type: ignore[attr-defined]
+        return 1
+
+    class Kernel32:
+        CreateJobObjectW = _FakeWinFunction(create_job)
+        CloseHandle = _FakeWinFunction(lambda _handle: calls.append("close_job"))
+        SetInformationJobObject = _FakeWinFunction(configure)
+        AssignProcessToJobObject = _FakeWinFunction(assign)
+        IsProcessInJob = _FakeWinFunction(verify)
+        TerminateProcess = _FakeWinFunction(
+            lambda *_args: calls.append("terminate_process")
+        )
+        TerminateJobObject = _FakeWinFunction(lambda *_args: None)
+
+    class Process:
+        _handle = 202
+
+    monkeypatch.setattr(mcp_proxy.ctypes, "WinDLL", lambda *_a, **_k: Kernel32())
+
+    with pytest.raises(OSError):
+        mcp_proxy._WindowsJob(Process())  # type: ignore[arg-type]
+
+    assert calls == expected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job launch semantics")
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "snapshot",
+        "first",
+        "next",
+        "no_thread",
+        "multiple",
+        "open",
+        "ownership",
+        "resume",
+        "suspend_count",
+    ],
+)
+def test_windows_resume_api_failures_leave_process_suspended(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    calls: list[str] = []
+    next_calls = 0
+
+    def snapshot(*_args: object) -> int:
+        if failure == "snapshot":
+            ctypes.set_last_error(5)
+            return ctypes.c_void_p(-1).value  # type: ignore[return-value]
+        return 303
+
+    def first(_snapshot: object, entry: object) -> int:
+        if failure == "first":
+            ctypes.set_last_error(5)
+            return 0
+        entry._obj.th32OwnerProcessID = 9999 if failure == "no_thread" else 4321  # type: ignore[attr-defined]
+        entry._obj.th32ThreadID = 404  # type: ignore[attr-defined]
+        return 1
+
+    def next_thread(_snapshot: object, entry: object) -> int:
+        nonlocal next_calls
+        if failure == "next":
+            ctypes.set_last_error(5)
+            return 0
+        if failure == "multiple" and next_calls == 0:
+            next_calls += 1
+            entry._obj.th32OwnerProcessID = 4321  # type: ignore[attr-defined]
+            entry._obj.th32ThreadID = 405  # type: ignore[attr-defined]
+            return 1
+        ctypes.set_last_error(mcp_proxy._ERROR_NO_MORE_FILES)
+        return 0
+
+    def open_thread(*_args: object) -> int:
+        if failure == "open":
+            ctypes.set_last_error(5)
+            return 0
+        return 505
+
+    def resume(*_args: object) -> int:
+        if failure == "resume":
+            ctypes.set_last_error(5)
+            return 0xFFFFFFFF
+        if failure == "suspend_count":
+            return 2
+        return 1
+
+    class Kernel32:
+        CreateToolhelp32Snapshot = _FakeWinFunction(snapshot)
+        Thread32First = _FakeWinFunction(first)
+        Thread32Next = _FakeWinFunction(next_thread)
+        OpenThread = _FakeWinFunction(open_thread)
+        GetProcessIdOfThread = _FakeWinFunction(
+            lambda _thread: 9999 if failure == "ownership" else 4321
+        )
+        ResumeThread = _FakeWinFunction(resume)
+        CloseHandle = _FakeWinFunction(lambda handle: calls.append(f"close:{handle}"))
+
+    class Process:
+        pid = 4321
+
+    monkeypatch.setattr(mcp_proxy.ctypes, "WinDLL", lambda *_a, **_k: Kernel32())
+
+    with pytest.raises(OSError):
+        mcp_proxy._resume_windows_process(Process())  # type: ignore[arg-type]
+
+    if failure == "snapshot":
+        assert calls == []
+    else:
+        assert calls[0] == "close:303"
+        if failure == "resume":
+            assert calls[-1] == "close:505"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job launch semantics")
+def test_windows_thread_snapshot_retries_transient_bad_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def snapshot(*_args: object) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            ctypes.set_last_error(mcp_proxy._ERROR_BAD_LENGTH)
+            return ctypes.c_void_p(-1).value  # type: ignore[return-value]
+        return 303
+
+    def first(_snapshot: object, entry: object) -> int:
+        entry._obj.th32OwnerProcessID = 4321  # type: ignore[attr-defined]
+        entry._obj.th32ThreadID = 404  # type: ignore[attr-defined]
+        return 1
+
+    def no_more(*_args: object) -> int:
+        ctypes.set_last_error(mcp_proxy._ERROR_NO_MORE_FILES)
+        return 0
+
+    class Kernel32:
+        CreateToolhelp32Snapshot = _FakeWinFunction(snapshot)
+        Thread32First = _FakeWinFunction(first)
+        Thread32Next = _FakeWinFunction(no_more)
+        OpenThread = _FakeWinFunction(lambda *_args: 505)
+        GetProcessIdOfThread = _FakeWinFunction(lambda _thread: 4321)
+        ResumeThread = _FakeWinFunction(lambda _thread: 1)
+        CloseHandle = _FakeWinFunction(lambda _handle: None)
+
+    class Process:
+        pid = 4321
+
+    monkeypatch.setattr(mcp_proxy.ctypes, "WinDLL", lambda *_a, **_k: Kernel32())
+    monkeypatch.setattr(mcp_proxy.time, "sleep", lambda delay: sleeps.append(delay))
+
+    mcp_proxy._resume_windows_process(Process())  # type: ignore[arg-type]
+
+    assert attempts == 3
+    assert sleeps == [mcp_proxy.POLL_SECONDS, mcp_proxy.POLL_SECONDS]
+
+
+def test_windows_launch_abort_without_job_escalates_to_kill() -> None:
+    order: list[str] = []
+
+    class Process:
+        waits = 0
+
+        def terminate(self) -> None:
+            order.append("terminate")
+
+        def wait(self, *, timeout: float) -> int:
+            self.waits += 1
+            order.append("wait")
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("server", timeout)
+            return 1
+
+        def kill(self) -> None:
+            order.append("kill")
+
+    mcp_proxy._abort_windows_launch(Process(), None)  # type: ignore[arg-type]
+
+    assert order == ["terminate", "wait", "kill", "wait"]
+
+
+def test_windows_launch_abort_closes_streams_and_job_when_termination_fails() -> None:
+    order: list[str] = []
+
+    class Stream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            order.append(f"close_{self.name}")
+
+    class Process:
+        stdin = Stream("stdin")
+        stdout = Stream("stdout")
+        stderr = Stream("stderr")
+
+        def wait(self, *, timeout: float) -> int:
+            order.append("wait")
+            return 1
+
+    class Job:
+        def terminate(self) -> None:
+            order.append("terminate_job")
+            raise OSError("termination failed")
+
+        def close(self) -> None:
+            order.append("close_job")
+
+    mcp_proxy._abort_windows_launch(Process(), Job())  # type: ignore[arg-type]
+
+    assert order == [
+        "terminate_job",
+        "wait",
+        "close_stdin",
+        "close_stdout",
+        "close_stderr",
+        "close_job",
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job launch semantics")
+def test_windows_launch_is_suspended_until_job_membership_is_verified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    captured: dict[str, object] = {}
+
+    class Process:
+        pid = 4321
+
+    class Job:
+        def __init__(self, process: object) -> None:
+            assert isinstance(process, Process)
+            order.append("job")
+
+    def popen(command: list[str], **kwargs: object) -> Process:
+        captured["command"] = command
+        captured.update(kwargs)
+        order.append("popen")
+        return Process()
+
+    monkeypatch.setattr(mcp_proxy.subprocess, "Popen", popen)
+    monkeypatch.setattr(mcp_proxy, "_WindowsJob", Job)
+    monkeypatch.setattr(
+        mcp_proxy,
+        "_resume_windows_process",
+        lambda process: order.append("resume"),
+    )
+
+    process, job, process_group = mcp_proxy._launch_process(["server.exe"])
+
+    assert isinstance(process, Process)
+    assert isinstance(job, Job)
+    assert process_group is None
+    assert order == ["popen", "job", "resume"]
+    assert int(captured["creationflags"]) & mcp_proxy._CREATE_SUSPENDED
+    assert int(captured["creationflags"]) & subprocess.CREATE_NEW_PROCESS_GROUP
+    assert captured["shell"] is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job launch semantics")
+def test_windows_launch_failure_terminates_job_before_reporting_spawn_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+
+    class Process:
+        pid = 4321
+
+        def wait(self, *, timeout: float) -> int:
+            order.append("wait")
+            return 1
+
+        def kill(self) -> None:
+            order.append("kill")
+
+    class Job:
+        def __init__(self, _process: object) -> None:
+            order.append("job")
+
+        def terminate(self) -> None:
+            order.append("terminate_job")
+
+        def close(self) -> None:
+            order.append("close_job")
+
+    monkeypatch.setattr(mcp_proxy.subprocess, "Popen", lambda *_a, **_k: Process())
+    monkeypatch.setattr(mcp_proxy, "_WindowsJob", Job)
+    monkeypatch.setattr(
+        mcp_proxy,
+        "_resume_windows_process",
+        lambda _process: (_ for _ in ()).throw(OSError("resume failed")),
+    )
+
+    with pytest.raises(OSError, match="secure Windows process launch unavailable"):
+        mcp_proxy._launch_process(["server.exe"])
+
+    assert order == ["job", "terminate_job", "wait", "close_job"]
 
 
 def test_descendant_cleanup_does_not_mask_independent_child_failure(
