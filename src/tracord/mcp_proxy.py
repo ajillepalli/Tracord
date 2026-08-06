@@ -889,17 +889,30 @@ def _terminate_tree(
         os.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
         return
+    except PermissionError:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        return
     deadline = time.monotonic() + PROCESS_TERM_GRACE_SECONDS
     while time.monotonic() < deadline:
         try:
             os.killpg(process_group, 0)
         except ProcessLookupError:
             break
+        except PermissionError:
+            return
         time.sleep(POLL_SECONDS)
     try:
         os.killpg(process_group, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        try:
+            process.kill()
+        except OSError:
+            pass
     try:
         process.wait(timeout=PROCESS_TERM_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
@@ -1140,7 +1153,10 @@ def proxy_mcp_stdio(
                 creationflags=creationflags,
             )
             if os.name != "nt":
-                process_group = process.pid
+                try:
+                    process_group = os.getpgid(process.pid)
+                except ProcessLookupError:
+                    process_group = process.pid
             try:
                 job = _WindowsJob(process)
             except OSError:
