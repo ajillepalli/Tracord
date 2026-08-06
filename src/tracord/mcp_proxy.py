@@ -688,18 +688,19 @@ def _relay_messages(
                 overflow = segment[remaining:]
                 if len(pending) > OBSERVATION_BYTES:
                     observer.mark_unobserved("oversized")
+                    observed_prefix = bytes(pending)
+                    pending.clear()
                     if target_channel is not None:
-                        if not target_channel.write(pending):
+                        if not target_channel.write(observed_prefix):
                             return
                     else:
-                        _raw_write(target_fd, pending, target_lock)
+                        _raw_write(target_fd, observed_prefix, target_lock)
                     if overflow:
                         if target_channel is not None:
                             if not target_channel.write(overflow):
                                 return
                         else:
                             _raw_write(target_fd, overflow, target_lock)
-                    pending.clear()
                     streaming = newline < 0
                 elif newline >= 0:
                     payload = bytes(pending)
@@ -916,6 +917,7 @@ def _proxy_exit_code(
     failures: list[str],
     incomplete_inflight: bool,
     proxy_cleanup: bool,
+    child_exited: bool,
     raw_child_code: int | None,
 ) -> int:
     if caught_signal is not None:
@@ -927,6 +929,8 @@ def _proxy_exit_code(
         return signal_codes.get(caught_signal, 1)
     if failures or incomplete_inflight:
         return 1
+    if child_exited:
+        return _mapped_exit_code(raw_child_code)
     if proxy_cleanup:
         return 0
     return _mapped_exit_code(raw_child_code)
@@ -1085,6 +1089,7 @@ def proxy_mcp_stdio(
     job: _WindowsJob | None = None
     process_group: int | None = None
     proxy_cleanup = False
+    child_exited = False
     shutdown_reason = "child_exit"
     caught_signal: int | None = None
     old_handlers: dict[int, object] = {}
@@ -1196,7 +1201,6 @@ def proxy_mcp_stdio(
             thread.start()
 
         eof_deadline: float | None = None
-        child_exited = False
         tree_terminated = False
         while True:
             if caught_signal is not None:
@@ -1268,6 +1272,7 @@ def proxy_mcp_stdio(
         failures,
         incomplete_inflight,
         proxy_cleanup,
+        child_exited,
         raw_child_code,
     )
     status = "passed" if exit_code == 0 else "failed"
@@ -1327,6 +1332,7 @@ def proxy_mcp_stdio(
             failures,
             incomplete_inflight,
             proxy_cleanup,
+            child_exited,
             raw_child_code,
         )
         _collapse_oversized_trace(
@@ -1350,6 +1356,7 @@ def proxy_mcp_stdio(
         failures,
         incomplete_inflight,
         proxy_cleanup,
+        child_exited,
         raw_child_code,
     )
 

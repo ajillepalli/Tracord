@@ -28,7 +28,7 @@ if MODE == "server-request":
 
 if MODE == "spawn-descendant":
     subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-    raise SystemExit(0)
+    raise SystemExit(int(sys.argv[2]) if len(sys.argv) > 2 else 0)
 
 if MODE == "flood":
     for _index in range(256):

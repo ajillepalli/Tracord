@@ -436,6 +436,37 @@ def test_observation_buffer_stops_at_limit_plus_one(
     assert observer.unobserved_messages == 1
 
 
+def test_overflow_write_failure_does_not_repeat_forwarded_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_proxy, "OBSERVATION_BYTES", 4)
+    reads = iter([b"abcdefghijkl"])
+    attempts: list[bytes] = []
+
+    def write(_fd: int, data: bytes, _lock: object) -> None:
+        attempts.append(bytes(data))
+        if len(attempts) == 2:
+            raise OSError("blocked")
+
+    monkeypatch.setattr(mcp_proxy, "_raw_read", lambda _fd: next(reads))
+    monkeypatch.setattr(mcp_proxy, "_raw_write", write)
+    observer = mcp_proxy._Observer("omitted", "2026-08-05T00:00:00Z", ["server"], ".")
+    failures: list[str] = []
+    mcp_proxy._relay_messages(
+        0,
+        1,
+        mcp_proxy.threading.Lock(),
+        observer,
+        "server",
+        mcp_proxy.threading.Event(),
+        failures,
+        mcp_proxy.threading.Event(),
+    )
+
+    assert attempts == [b"abcde", b"fghijkl"]
+    assert failures == ["mcp_relay_failed"]
+
+
 def test_partial_message_is_flushed_when_shutdown_arrives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -621,6 +652,20 @@ def test_non_exiting_descendant_is_cleaned_up(tmp_path: Path) -> None:
     assert trace["mcp_proxy"]["proxy_initiated_cleanup"] is True
     assert trace["mcp_proxy"]["shutdown_reason"] == "descendant_grace_expired"
     assert "descendant_cleanup" in trace["mcp_proxy"]["observation"]["reasons"]
+
+
+def test_descendant_cleanup_does_not_mask_independent_child_failure(
+    tmp_path: Path,
+) -> None:
+    completed, trace, _run_dir = run_proxy(
+        tmp_path, b"", fixture_args=("spawn-descendant", "7")
+    )
+
+    assert completed.returncode == 7
+    assert trace["status"] == "failed"
+    assert trace["exit_code"] == 7
+    assert trace["mcp_proxy"]["raw_child_exit_code"] == 7
+    assert trace["mcp_proxy"]["proxy_initiated_cleanup"] is True
 
 
 def test_blocked_stdout_consumer_does_not_block_cleanup(tmp_path: Path) -> None:
