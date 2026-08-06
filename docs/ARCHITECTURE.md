@@ -71,9 +71,11 @@ stored argv, and the final trace all have independent bounds.
 
 The proxy and command recorder share identity-checked run creation, exclusive
 artifact writes, and atomic `trace.json` publication. POSIX children run in a
-new process group. Windows children are assigned to a verified kill-on-close
-Job Object. Client EOF and intercepted signals use bounded graceful shutdown
-and process-tree cleanup. See [mcp-stdio-proxy.md](mcp-stdio-proxy.md).
+new process group. Windows children are created suspended, assigned to a
+verified kill-on-close Job Object, and resumed only after membership succeeds;
+unexpected initial-thread state fails launch closed. Client EOF and intercepted
+signals use bounded graceful shutdown and process-tree cleanup. See
+[mcp-stdio-proxy.md](mcp-stdio-proxy.md).
 
 ## Bundle Model
 

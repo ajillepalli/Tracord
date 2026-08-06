@@ -43,6 +43,13 @@ CLIENT_EOF_GRACE_SECONDS = 2.0
 PROCESS_TERM_GRACE_SECONDS = 1.0
 POLL_SECONDS = 0.05
 IO_CHUNK_BYTES = 64 * 1024
+_CREATE_SUSPENDED = 0x00000004
+_TH32CS_SNAPTHREAD = 0x00000004
+_THREAD_SUSPEND_RESUME = 0x0002
+_THREAD_QUERY_LIMITED_INFORMATION = 0x0800
+_ERROR_NO_MORE_FILES = 18
+_ERROR_BAD_LENGTH = 24
+_THREAD_SNAPSHOT_ATTEMPTS = 5
 
 CaptureMode = Literal["omitted", "redacted", "captured"]
 Direction = Literal["client", "server"]
@@ -831,9 +838,6 @@ class _WindowsJob:
             raise OSError(ctypes.get_last_error(), "SetInformationJobObject")
         process_handle = ctypes.c_void_p(int(process._handle))  # type: ignore[attr-defined]
         if not kernel32.AssignProcessToJobObject(handle, process_handle):
-            if process.poll() is not None:
-                kernel32.CloseHandle(handle)
-                return
             kernel32.TerminateProcess(process_handle, 1)
             kernel32.CloseHandle(handle)
             raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject")
@@ -857,6 +861,160 @@ class _WindowsJob:
             self._kernel32.CloseHandle(self.handle)
             self.handle = None
             self._kernel32 = None
+
+
+def _resume_windows_process(process: subprocess.Popen[bytes]) -> None:
+    """Resume the sole initial thread of a CREATE_SUSPENDED child."""
+    if os.name != "nt":
+        return
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class _ThreadEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.Thread32First.restype = wintypes.BOOL
+    kernel32.Thread32First.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ThreadEntry32)]
+    kernel32.Thread32Next.restype = wintypes.BOOL
+    kernel32.Thread32Next.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ThreadEntry32)]
+    kernel32.OpenThread.restype = ctypes.c_void_p
+    kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.GetProcessIdOfThread.restype = wintypes.DWORD
+    kernel32.GetProcessIdOfThread.argtypes = [ctypes.c_void_p]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    kernel32.ResumeThread.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    invalid_handle = ctypes.c_void_p(-1).value
+    snapshot: int | None = None
+    for attempt in range(_THREAD_SNAPSHOT_ATTEMPTS):
+        snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+        if snapshot and snapshot != invalid_handle:
+            break
+        error = ctypes.get_last_error()
+        if error != _ERROR_BAD_LENGTH or attempt + 1 == _THREAD_SNAPSHOT_ATTEMPTS:
+            raise OSError(error, "CreateToolhelp32Snapshot")
+        time.sleep(POLL_SECONDS)
+    if not snapshot or snapshot == invalid_handle:
+        raise OSError(errno.ENOTSUP, "CreateToolhelp32Snapshot")
+
+    thread_ids: list[int] = []
+    try:
+        entry = _ThreadEntry32()
+        entry.dwSize = ctypes.sizeof(entry)
+        if not kernel32.Thread32First(snapshot, ctypes.byref(entry)):
+            raise OSError(ctypes.get_last_error(), "Thread32First")
+        while True:
+            if int(entry.th32OwnerProcessID) == process.pid:
+                thread_ids.append(int(entry.th32ThreadID))
+            entry.dwSize = ctypes.sizeof(entry)
+            if kernel32.Thread32Next(snapshot, ctypes.byref(entry)):
+                continue
+            error = ctypes.get_last_error()
+            if error != _ERROR_NO_MORE_FILES:
+                raise OSError(error, "Thread32Next")
+            break
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+    if len(thread_ids) != 1:
+        raise OSError(errno.ENOTSUP, "suspended process did not have one initial thread")
+    thread = kernel32.OpenThread(
+        _THREAD_SUSPEND_RESUME | _THREAD_QUERY_LIMITED_INFORMATION,
+        False,
+        thread_ids[0],
+    )
+    if not thread:
+        raise OSError(ctypes.get_last_error(), "OpenThread")
+    try:
+        if int(kernel32.GetProcessIdOfThread(thread)) != process.pid:
+            raise OSError(errno.ENOTSUP, "initial thread ownership changed")
+        previous_count = int(kernel32.ResumeThread(thread))
+        if previous_count == 0xFFFFFFFF:
+            raise OSError(ctypes.get_last_error(), "ResumeThread")
+        if previous_count != 1:
+            raise OSError(errno.ENOTSUP, "unexpected initial thread suspend count")
+    finally:
+        kernel32.CloseHandle(thread)
+
+
+def _abort_windows_launch(
+    process: subprocess.Popen[bytes], job: _WindowsJob | None
+) -> None:
+    try:
+        try:
+            if job is not None:
+                job.terminate()
+            else:
+                process.terminate()
+        except BaseException:
+            pass
+        try:
+            process.wait(timeout=PROCESS_TERM_GRACE_SECONDS)
+        except BaseException:
+            try:
+                process.kill()
+            except BaseException:
+                pass
+            try:
+                process.wait(timeout=PROCESS_TERM_GRACE_SECONDS)
+            except BaseException:
+                pass
+    finally:
+        for name in ("stdin", "stdout", "stderr"):
+            stream = getattr(process, name, None)
+            if stream is not None:
+                try:
+                    stream.close()
+                except BaseException:
+                    pass
+        if job is not None:
+            try:
+                job.close()
+            except BaseException:
+                pass
+
+
+def _launch_process(
+    command: list[str],
+) -> tuple[subprocess.Popen[bytes], _WindowsJob | None, int | None]:
+    windows = os.name == "nt"
+    creationflags = 0
+    if windows:
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | _CREATE_SUSPENDED
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        start_new_session=not windows,
+        creationflags=creationflags,
+    )
+    if not windows:
+        return process, None, _capture_process_group(process)
+
+    job: _WindowsJob | None = None
+    try:
+        job = _WindowsJob(process)
+        _resume_windows_process(process)
+    except BaseException as exc:
+        _abort_windows_launch(process, job)
+        if isinstance(exc, (AttributeError, OSError)):
+            raise OSError("secure Windows process launch unavailable") from exc
+        raise
+    return process, job, None
 
 
 def _capture_process_group(process: subprocess.Popen[bytes]) -> int | None:
@@ -1168,31 +1326,8 @@ def proxy_mcp_stdio(
             signal.signal(signum, request_signal)
 
     try:
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         try:
-            process = subprocess.Popen(
-                resolved,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
-                start_new_session=os.name != "nt",
-                creationflags=creationflags,
-            )
-            if os.name != "nt":
-                process_group = _capture_process_group(process)
-            try:
-                job = _WindowsJob(process)
-            except OSError:
-                try:
-                    process.terminate()
-                    process.wait(timeout=PROCESS_TERM_GRACE_SECONDS)
-                except (OSError, subprocess.TimeoutExpired):
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
-                raise
+            process, job, process_group = _launch_process(resolved)
         except OSError:
             raise McpProxyError("mcp_spawn_failed") from None
         assert process.stdin is not None
