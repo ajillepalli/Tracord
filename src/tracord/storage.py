@@ -157,9 +157,9 @@ def verify_prepared_store(store: PreparedStore) -> bool:
 
 def prepare_run_for_write(root: Path, run_id: str) -> PreparedRun:
     """Create one unique run directory and bind it to its store identity."""
-    store = prepare_store_for_write(root)
-    path = store.runs / run_id
     try:
+        store = prepare_store_for_write(root)
+        path = store.runs / run_id
         if not verify_prepared_store(store):
             raise StoreSafetyError("changed")
         path.mkdir(exist_ok=False)
@@ -207,14 +207,14 @@ def write_prepared_bytes(run: PreparedRun, name: str, data: bytes) -> None:
 
 def publish_prepared_json(run: PreparedRun, name: str, data: dict[str, Any]) -> None:
     """Atomically publish one JSON file inside a prepared run directory."""
-    payload = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    payload = encode_prepared_json(data)
     temp_name = f".{name}.{uuid.uuid4().hex}.tmp"
     temp_path = run.path / temp_name
     target = run.path / name
     try:
         if not verify_prepared_run(run):
             raise StoreSafetyError("changed")
-        with temp_path.open("x", encoding="utf-8", newline="\n") as stream:
+        with temp_path.open("xb") as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
@@ -235,6 +235,13 @@ def publish_prepared_json(run: PreparedRun, name: str, data: dict[str, Any]) -> 
         except OSError:
             pass
         raise StoreSafetyError("write_failed") from None
+
+
+def encode_prepared_json(data: dict[str, Any]) -> bytes:
+    """Encode JSON exactly as atomic publication writes it."""
+    return (
+        json.dumps(data, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    ).encode("utf-8")
 
 
 def _directory_snapshot(path: Path) -> stat_result:

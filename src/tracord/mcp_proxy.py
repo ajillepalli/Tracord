@@ -23,6 +23,7 @@ from .result_codes import MAX_SAFE_JSON_INTEGER
 from .schema import MAX_TRACE_NESTING_DEPTH, SCHEMA_VERSION
 from .storage import (
     StoreSafetyError,
+    encode_prepared_json,
     prepare_run_for_write,
     publish_prepared_json,
     write_prepared_bytes,
@@ -73,6 +74,26 @@ class _DuplicateKey(ValueError):
 
 class _RedactionCollision(ValueError):
     pass
+
+
+@dataclass(slots=True)
+class _WriteChannel:
+    fd: int
+    lock: threading.Lock
+    closed: threading.Event
+
+    def write(self, data: bytes) -> bool:
+        return _raw_write(self.fd, data, self.lock, closed=self.closed)
+
+    def close(self, stream: object) -> None:
+        with self.lock:
+            if self.closed.is_set():
+                return
+            self.closed.set()
+            try:
+                stream.close()  # type: ignore[attr-defined]
+            except OSError:
+                pass
 
 
 def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -199,6 +220,8 @@ class _Observer:
 
     def mark_unobserved(self, reason: str) -> None:
         with self.lock:
+            if self.sealed:
+                return
             self._mark_unobserved_locked(reason)
 
     def _mark_unobserved_locked(self, reason: str) -> None:
@@ -260,7 +283,6 @@ class _Observer:
         inflight_key = ("client", key[0], key[1])
         with self.lock:
             if self.sealed:
-                self._mark_unobserved_locked("sealed")
                 return
             if inflight_key in self.in_flight or inflight_key in self.ignored_response_keys:
                 self._mark_unobserved_locked("duplicate_id")
@@ -292,7 +314,6 @@ class _Observer:
             return
         with self.lock:
             if self.sealed:
-                self._mark_unobserved_locked("sealed")
                 return
             entry = self.in_flight.pop(("client", key[0], key[1]), None)
             if entry is None:
@@ -309,7 +330,6 @@ class _Observer:
             return
         with self.lock:
             if self.sealed:
-                self._mark_unobserved_locked("sealed")
                 return
             inflight_key = ("client", key[0], key[1])
             entry = self.in_flight.pop(inflight_key, None)
@@ -393,14 +413,29 @@ class _Observer:
             self.sealed = True
             if reason:
                 self.reasons.add(reason)
-            metadata = {
-                "complete": not self.reasons,
-                "unobserved_messages": self.unobserved_messages,
-                "unmatched_results": self.unmatched_results,
-                "events_dropped": self.events_dropped,
-                "reasons": sorted(self.reasons),
-            }
-            return list(self.events), metadata
+            return list(self.events), self._snapshot_locked()
+
+    def snapshot_observation(self) -> dict[str, object]:
+        with self.lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict[str, object]:
+        return {
+            "complete": not self.reasons,
+            "unobserved_messages": self.unobserved_messages,
+            "unmatched_results": self.unmatched_results,
+            "events_dropped": self.events_dropped,
+            "reasons": sorted(self.reasons),
+        }
+
+    def record_final_size_omission(self) -> None:
+        with self.lock:
+            self.capture_omitted["final_size"] += 1
+
+    def record_dropped_events(self, count: int) -> None:
+        with self.lock:
+            self.events_dropped += count
+            self.reasons.add("events_dropped")
 
 
 def _sanitize_command(command: list[str]) -> tuple[list[str], bool, int]:
@@ -498,7 +533,9 @@ def _resolve_executable(command: list[str]) -> list[str]:
                     continue
                 for suffix in suffixes:
                     found = directory / f"{target}{suffix}"
-                    if found.is_file():
+                    if found.is_file() and (
+                        os.name == "nt" or os.access(found, os.X_OK)
+                    ):
                         candidate = found.resolve()
                         break
                 if candidate is not None:
@@ -548,9 +585,17 @@ def _prepare_standard_fds() -> tuple[int, int]:
         raise
 
 
-def _raw_write(fd: int, data: bytes, lock: threading.Lock) -> None:
+def _raw_write(
+    fd: int,
+    data: bytes,
+    lock: threading.Lock,
+    *,
+    closed: threading.Event | None = None,
+) -> bool:
     view = memoryview(data)
     with lock:
+        if closed is not None and closed.is_set():
+            return False
         while view:
             try:
                 written = os.write(fd, view)
@@ -569,6 +614,7 @@ def _raw_write(fd: int, data: bytes, lock: threading.Lock) -> None:
             if written <= 0:
                 raise OSError(errno.EPIPE, "zero-byte write")
             view = view[written:]
+    return True
 
 
 def _raw_read(fd: int) -> bytes:
@@ -598,6 +644,7 @@ def _relay_messages(
     shutdown: threading.Event,
     *,
     on_eof: Callable[[], None] | None = None,
+    target_channel: _WriteChannel | None = None,
 ) -> None:
     pending = bytearray()
     streaming = False
@@ -607,10 +654,17 @@ def _relay_messages(
             if not chunk:
                 if pending:
                     if streaming:
-                        _raw_write(target_fd, pending, target_lock)
+                        if target_channel is not None:
+                            target_channel.write(pending)
+                        else:
+                            _raw_write(target_fd, pending, target_lock)
                     else:
                         observer.observe(direction, bytes(pending))
-                        _raw_write(target_fd, pending, target_lock)
+                        if target_channel is not None:
+                            target_channel.write(pending)
+                        else:
+                            _raw_write(target_fd, pending, target_lock)
+                    pending.clear()
                 if on_eof is not None:
                     on_eof()
                 return
@@ -621,7 +675,11 @@ def _relay_messages(
                 segment = chunk[offset:end]
                 offset = end
                 if streaming:
-                    _raw_write(target_fd, segment, target_lock)
+                    if target_channel is not None:
+                        if not target_channel.write(segment):
+                            return
+                    else:
+                        _raw_write(target_fd, segment, target_lock)
                     if newline >= 0:
                         streaming = False
                     continue
@@ -630,21 +688,41 @@ def _relay_messages(
                 overflow = segment[remaining:]
                 if len(pending) > OBSERVATION_BYTES:
                     observer.mark_unobserved("oversized")
-                    _raw_write(target_fd, pending, target_lock)
+                    if target_channel is not None:
+                        if not target_channel.write(pending):
+                            return
+                    else:
+                        _raw_write(target_fd, pending, target_lock)
                     if overflow:
-                        _raw_write(target_fd, overflow, target_lock)
+                        if target_channel is not None:
+                            if not target_channel.write(overflow):
+                                return
+                        else:
+                            _raw_write(target_fd, overflow, target_lock)
                     pending.clear()
                     streaming = newline < 0
                 elif newline >= 0:
                     payload = bytes(pending)
                     pending.clear()
                     observer.observe(direction, payload)
-                    _raw_write(target_fd, payload, target_lock)
+                    if target_channel is not None:
+                        if not target_channel.write(payload):
+                            return
+                    else:
+                        _raw_write(target_fd, payload, target_lock)
     except BaseException:
         if not shutdown.is_set():
             failure.append("mcp_relay_failed")
             shutdown.set()
     finally:
+        if pending:
+            try:
+                if target_channel is not None:
+                    target_channel.write(pending)
+                else:
+                    _raw_write(target_fd, pending, target_lock)
+            except OSError:
+                pass
         done.set()
 
 
@@ -732,6 +810,9 @@ class _WindowsJob:
             raise OSError(ctypes.get_last_error(), "SetInformationJobObject")
         process_handle = ctypes.c_void_p(int(process._handle))  # type: ignore[attr-defined]
         if not kernel32.AssignProcessToJobObject(handle, process_handle):
+            if process.poll() is not None:
+                kernel32.CloseHandle(handle)
+                return
             kernel32.TerminateProcess(process_handle, 1)
             kernel32.CloseHandle(handle)
             raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject")
@@ -757,44 +838,66 @@ class _WindowsJob:
             self._kernel32 = None
 
 
-def _terminate_tree(process: subprocess.Popen[bytes], job: _WindowsJob | None) -> None:
+def _terminate_tree(
+    process: subprocess.Popen[bytes],
+    job: _WindowsJob | None,
+    process_group: int | None,
+) -> None:
     if os.name == "nt":
         if job is not None:
             job.terminate()
         elif process.poll() is None:
             process.terminate()
-    else:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
+            process.wait(timeout=PROCESS_TERM_GRACE_SECONDS)
             return
-    if os.name != "nt":
-        deadline = time.monotonic() + PROCESS_TERM_GRACE_SECONDS
-        while time.monotonic() < deadline:
-            process.poll()
-            try:
-                os.killpg(process.pid, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(POLL_SECONDS)
-    try:
-        process.wait(timeout=PROCESS_TERM_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        pass
-    if os.name == "nt":
-        if job is not None:
-            job.terminate()
-        elif process.poll() is None:
-            process.kill()
-    else:
+        except subprocess.TimeoutExpired:
+            if job is not None:
+                job.terminate()
+            else:
+                process.kill()
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+            process.wait(timeout=PROCESS_TERM_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
             pass
+        return
+
+    if process_group is None:
+        return
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + PROCESS_TERM_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(POLL_SECONDS)
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
     try:
         process.wait(timeout=PROCESS_TERM_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _child_exited_without_reaping(process: subprocess.Popen[bytes]) -> bool:
+    waitid_names = ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+    if os.name == "nt" or not all(hasattr(os, name) for name in waitid_names):
+        return process.poll() is not None
+    try:
+        result = os.waitid(
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except ChildProcessError:
+        return process.poll() is not None
+    return result is not None
 
 
 def _mapped_exit_code(raw: int | None) -> int:
@@ -810,7 +913,7 @@ def _mapped_exit_code(raw: int | None) -> int:
 
 def _trim_trace(trace: dict[str, object], observer: _Observer) -> None:
     def encoded_size() -> int:
-        return len(json.dumps(trace, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+        return len(encode_prepared_json(trace))
 
     events = trace["events"]
     assert isinstance(events, list)
@@ -826,7 +929,7 @@ def _trim_trace(trace: dict[str, object], observer: _Observer) -> None:
         if isinstance(capture, dict) and capture.get("capture") != "omitted":
             capture.clear()
             capture["capture"] = "omitted"
-            observer.capture_omitted["final_size"] += 1
+            observer.record_final_size_omission()
     while encoded_size() > TRACE_TARGET_BYTES:
         tool_index = next(
             (
@@ -851,8 +954,7 @@ def _trim_trace(trace: dict[str, object], observer: _Observer) -> None:
             else:
                 kept.append(item)
         events[:] = kept
-        observer.events_dropped += removed
-        observer.reasons.add("events_dropped")
+        observer.record_dropped_events(removed)
 
 
 def proxy_mcp_stdio(
@@ -872,7 +974,7 @@ def proxy_mcp_stdio(
         raise McpProxyError("mcp_stdio_unavailable") from None
     try:
         prepared = prepare_run_for_write(root, new_run_id())
-    except StoreSafetyError:
+    except (OSError, StoreSafetyError):
         os.close(stdout_fd)
         os.close(stderr_fd)
         raise McpProxyError("mcp_store_unwritable") from None
@@ -892,6 +994,7 @@ def proxy_mcp_stdio(
     stderr_last: list[int | None] = [None]
     process: subprocess.Popen[bytes] | None = None
     job: _WindowsJob | None = None
+    process_group: int | None = None
     proxy_cleanup = False
     shutdown_reason = "child_exit"
     caught_signal: int | None = None
@@ -922,6 +1025,11 @@ def proxy_mcp_stdio(
                 start_new_session=os.name != "nt",
                 creationflags=creationflags,
             )
+            if os.name != "nt":
+                try:
+                    process_group = os.getpgid(process.pid)
+                except ProcessLookupError:
+                    process_group = None
             try:
                 job = _WindowsJob(process)
             except OSError:
@@ -940,27 +1048,31 @@ def proxy_mcp_stdio(
         assert process.stdout is not None
         assert process.stderr is not None
 
+        child_stdin = _WriteChannel(
+            process.stdin.fileno(), threading.Lock(), threading.Event()
+        )
+
         def close_child_stdin() -> None:
+            child_stdin.close(process.stdin)
+
+        def client_closed() -> None:
             client_eof.set()
-            try:
-                process.stdin.close()
-            except OSError:
-                pass
+            close_child_stdin()
 
         threads = [
             threading.Thread(
                 target=_relay_messages,
                 args=(
                     0,
-                    process.stdin.fileno(),
-                    threading.Lock(),
+                    child_stdin.fd,
+                    child_stdin.lock,
                     observer,
                     "client",
                     client_done,
                     failures,
                     shutdown,
                 ),
-                kwargs={"on_eof": close_child_stdin},
+                kwargs={"on_eof": client_closed, "target_channel": child_stdin},
                 daemon=True,
             ),
             threading.Thread(
@@ -995,6 +1107,8 @@ def proxy_mcp_stdio(
             thread.start()
 
         eof_deadline: float | None = None
+        child_exited = False
+        tree_terminated = False
         while True:
             if caught_signal is not None:
                 shutdown_reason = "signal"
@@ -1002,8 +1116,8 @@ def proxy_mcp_stdio(
             if failures:
                 shutdown_reason = failures[0]
                 break
-            raw = process.poll()
-            if raw is not None:
+            if _child_exited_without_reaping(process):
+                child_exited = True
                 shutdown_reason = "child_exit"
                 break
             if client_eof.is_set():
@@ -1016,26 +1130,26 @@ def proxy_mcp_stdio(
                     break
             shutdown.wait(POLL_SECONDS)
 
-        if process.poll() is None and (proxy_cleanup or failures or caught_signal is not None):
-            _terminate_tree(process, job)
-        try:
-            process.stdin.close()
-        except OSError:
-            pass
-        try:
-            raw_child_code = process.wait(timeout=PROCESS_TERM_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            _terminate_tree(process, job)
-            raw_child_code = process.poll()
+        if not child_exited and (proxy_cleanup or failures or caught_signal is not None):
+            _terminate_tree(process, job, process_group)
+            tree_terminated = True
+        close_child_stdin()
         stdout_done.wait(PROCESS_TERM_GRACE_SECONDS)
         stderr_done.wait(PROCESS_TERM_GRACE_SECONDS)
         if not stdout_done.is_set() or not stderr_done.is_set():
             proxy_cleanup = True
             shutdown_reason = "descendant_grace_expired"
             observer.mark_unobserved("descendant_cleanup")
-            _terminate_tree(process, job)
+            if not tree_terminated:
+                _terminate_tree(process, job, process_group)
+                tree_terminated = True
             stdout_done.wait(PROCESS_TERM_GRACE_SECONDS)
             stderr_done.wait(PROCESS_TERM_GRACE_SECONDS)
+        try:
+            raw_child_code = process.wait(timeout=PROCESS_TERM_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            _terminate_tree(process, job, process_group)
+            raw_child_code = process.poll()
     except McpProxyError as exc:
         failures.append(exc.code)
         shutdown_reason = exc.code
@@ -1043,8 +1157,8 @@ def proxy_mcp_stdio(
     except BaseException:
         failures.append("mcp_proxy_failed")
         shutdown_reason = "mcp_proxy_failed"
-        if process is not None and process.poll() is None:
-            _terminate_tree(process, job)
+        if process is not None:
+            _terminate_tree(process, job, process_group)
         raw_child_code = process.poll() if process is not None else None
     finally:
         shutdown.set()
@@ -1116,9 +1230,8 @@ def proxy_mcp_stdio(
     }
     try:
         _trim_trace(trace, observer)
-        observation["events_dropped"] = observer.events_dropped
-        observation["reasons"] = sorted(observer.reasons)
-        observation["complete"] = not observer.reasons
+        observation = observer.snapshot_observation()
+        metadata["observation"] = observation
         write_prepared_bytes(prepared, STDOUT_ARTIFACT, b"")
         write_prepared_bytes(prepared, STDERR_ARTIFACT, b"")
         publish_prepared_json(prepared, "trace.json", trace)

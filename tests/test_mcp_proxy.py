@@ -421,6 +421,54 @@ def test_observation_buffer_stops_at_limit_plus_one(
     assert observer.unobserved_messages == 1
 
 
+def test_partial_message_is_flushed_when_shutdown_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdown = mcp_proxy.threading.Event()
+    writes: list[bytes] = []
+
+    def read(_fd: int) -> bytes:
+        shutdown.set()
+        return b"partial"
+
+    monkeypatch.setattr(mcp_proxy, "_raw_read", read)
+    monkeypatch.setattr(
+        mcp_proxy,
+        "_raw_write",
+        lambda _fd, data, _lock, **_kwargs: writes.append(bytes(data)) or True,
+    )
+    observer = mcp_proxy._Observer("omitted", "2026-08-05T00:00:00Z", ["server"], ".")
+    done = mcp_proxy.threading.Event()
+    mcp_proxy._relay_messages(
+        0,
+        1,
+        mcp_proxy.threading.Lock(),
+        observer,
+        "client",
+        done,
+        [],
+        shutdown,
+    )
+    assert writes == [b"partial"]
+
+
+def test_closed_write_channel_cannot_write_to_reused_fd(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    stream = target.open("wb")
+    channel = mcp_proxy._WriteChannel(
+        stream.fileno(), mcp_proxy.threading.Lock(), mcp_proxy.threading.Event()
+    )
+    channel.close(stream)
+    replacement = os.open(target, os.O_WRONLY | os.O_APPEND)
+    try:
+        assert channel.write(b"private protocol bytes") is False
+    finally:
+        os.close(replacement)
+    assert target.read_bytes() == b""
+
+
 def test_raw_io_retries_interruptions_and_partial_writes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -460,13 +508,25 @@ def test_unsupported_jsonrpc_envelopes_are_not_observed() -> None:
     )
     observer.observe(
         "client",
-        b'{"jsonrpc":"2.0","id":2,"method":"tools/call","result":{},"params":{"name":"echo","arguments":{}}}\n',
+        (
+            b'{"jsonrpc":"2.0","id":2,"method":"tools/call","result":{},'
+            b'"params":{"name":"echo","arguments":{}}}\n'
+        ),
     )
     events, metadata = observer.seal()
 
     assert [event["type"] for event in events] == ["command.started"]
     assert metadata["unobserved_messages"] == 2
     assert metadata["reasons"] == ["unsupported_envelope"]
+
+
+def test_sealed_observer_metadata_is_immutable() -> None:
+    observer = mcp_proxy._Observer("omitted", "2026-08-05T00:00:00Z", ["server"], ".")
+    _events, before = observer.seal()
+    observer.mark_unobserved("late")
+    observer.observe("client", b"not-json\n")
+    after = observer.snapshot_observation()
+    assert after == before
 
 
 @pytest.mark.parametrize(
@@ -777,7 +837,9 @@ def test_trace_trimming_omits_captures_then_complete_call_pairs(
     for event in omitted["events"]:
         if event["type"] == "tool.call.started":
             event["data"]["input"] = {"capture": "omitted"}
-    omitted_size = len(json.dumps(omitted, separators=(",", ":")).encode())
+        elif event["type"] == "tool.call.finished":
+            event["data"]["output"] = {"capture": "omitted"}
+    omitted_size = len(mcp_proxy.encode_prepared_json(omitted))
     monkeypatch.setattr(mcp_proxy, "TRACE_TARGET_BYTES", omitted_size + 10)
     mcp_proxy._trim_trace(trace, observer)
     started = next(event for event in trace["events"] if event["type"] == "tool.call.started")
@@ -785,7 +847,7 @@ def test_trace_trimming_omits_captures_then_complete_call_pairs(
     assert observer.capture_omitted["final_size"] >= 1
 
     command_only = {"events": [events[0]]}
-    command_size = len(json.dumps(command_only, separators=(",", ":")).encode())
+    command_size = len(mcp_proxy.encode_prepared_json(command_only))
     trace = {"events": deepcopy(events)}
     monkeypatch.setattr(mcp_proxy, "TRACE_TARGET_BYTES", command_size + 1)
     mcp_proxy._trim_trace(trace, observer)
@@ -871,3 +933,19 @@ def test_windows_rejects_cwd_hijacking_and_batch_launchers(
         mcp_proxy._resolve_executable(["private"])
     with pytest.raises(mcp_proxy.McpProxyError, match="mcp_server_unsafe_launcher"):
         mcp_proxy._resolve_executable([str(batch)])
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX execute-bit policy")
+def test_posix_path_resolution_skips_non_executable_shadow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocked = tmp_path / "blocked"
+    allowed = tmp_path / "allowed"
+    blocked.mkdir()
+    allowed.mkdir()
+    (blocked / "server").write_text("not executable", encoding="ascii")
+    executable = allowed / "server"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join((str(blocked), str(allowed))))
+    assert mcp_proxy._resolve_executable(["server"])[0] == str(executable.resolve())
