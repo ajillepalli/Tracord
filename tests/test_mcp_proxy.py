@@ -515,6 +515,26 @@ def test_closed_write_channel_cannot_write_to_reused_fd(
     assert target.read_bytes() == b""
 
 
+def test_write_channel_close_is_bounded_while_writer_holds_lock(
+    tmp_path: Path,
+) -> None:
+    stream = (tmp_path / "target").open("wb")
+    channel = mcp_proxy._WriteChannel(
+        stream.fileno(), mcp_proxy.threading.Lock(), mcp_proxy.threading.Event()
+    )
+    channel.lock.acquire()
+    try:
+        assert channel.close(stream, timeout=0.01) is False
+        assert channel.closed.is_set()
+        assert not channel.stream_closed.is_set()
+    finally:
+        channel.lock.release()
+
+    assert channel.close(stream, timeout=0.01) is True
+    assert channel.stream_closed.is_set()
+    assert channel.write(b"late") is False
+
+
 def test_raw_io_retries_interruptions_and_partial_writes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -573,6 +593,16 @@ def test_sealed_observer_metadata_is_immutable() -> None:
     observer.observe("client", b"not-json\n")
     after = observer.snapshot_observation()
     assert after == before
+
+
+def test_incomplete_lifecycle_reason_does_not_count_as_a_message() -> None:
+    observer = mcp_proxy._Observer("omitted", "2026-08-05T00:00:00Z", ["server"], ".")
+    observer.mark_incomplete("descendant_cleanup")
+
+    metadata = observer.snapshot_observation()
+    assert metadata["complete"] is False
+    assert metadata["unobserved_messages"] == 0
+    assert metadata["reasons"] == ["descendant_cleanup"]
 
 
 @pytest.mark.parametrize(
@@ -666,6 +696,20 @@ def test_descendant_cleanup_does_not_mask_independent_child_failure(
     assert trace["exit_code"] == 7
     assert trace["mcp_proxy"]["raw_child_exit_code"] == 7
     assert trace["mcp_proxy"]["proxy_initiated_cleanup"] is True
+
+
+def test_blocked_child_stdin_does_not_block_descendant_cleanup(tmp_path: Path) -> None:
+    started = time.monotonic()
+    completed, trace, _run_dir = run_proxy(
+        tmp_path,
+        b"x" * (2 * 1024 * 1024),
+        fixture_args=("spawn-descendant",),
+    )
+
+    assert time.monotonic() - started < 8
+    assert completed.returncode == 0
+    assert trace["mcp_proxy"]["proxy_initiated_cleanup"] is True
+    assert "client_relay_blocked" in trace["mcp_proxy"]["observation"]["reasons"]
 
 
 def test_blocked_stdout_consumer_does_not_block_cleanup(tmp_path: Path) -> None:

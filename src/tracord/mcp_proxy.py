@@ -13,7 +13,7 @@ import stat
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -81,19 +81,33 @@ class _WriteChannel:
     fd: int
     lock: threading.Lock
     closed: threading.Event
+    stream_closed: threading.Event = field(default_factory=threading.Event)
 
     def write(self, data: bytes) -> bool:
         return _raw_write(self.fd, data, self.lock, closed=self.closed)
 
-    def close(self, stream: object) -> None:
-        with self.lock:
-            if self.closed.is_set():
-                return
-            self.closed.set()
+    def close(self, stream: object, timeout: float | None = None) -> bool:
+        self.closed.set()
+        if self.stream_closed.is_set():
+            return True
+        acquired = (
+            self.lock.acquire()
+            if timeout is None
+            else self.lock.acquire(timeout=max(0.0, timeout))
+        )
+        if not acquired:
+            return False
+        try:
+            if self.stream_closed.is_set():
+                return True
             try:
                 stream.close()  # type: ignore[attr-defined]
             except OSError:
                 pass
+            self.stream_closed.set()
+            return True
+        finally:
+            self.lock.release()
 
 
 def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -223,6 +237,11 @@ class _Observer:
             if self.sealed:
                 return
             self._mark_unobserved_locked(reason)
+
+    def mark_incomplete(self, reason: str) -> None:
+        with self.lock:
+            if not self.sealed:
+                self.reasons.add(reason)
 
     def _mark_unobserved_locked(self, reason: str) -> None:
         self.unobserved_messages += 1
@@ -653,18 +672,19 @@ def _relay_messages(
             chunk = _raw_read(source_fd)
             if not chunk:
                 if pending:
+                    payload = bytes(pending)
+                    pending.clear()
                     if streaming:
                         if target_channel is not None:
-                            target_channel.write(pending)
+                            target_channel.write(payload)
                         else:
-                            _raw_write(target_fd, pending, target_lock)
+                            _raw_write(target_fd, payload, target_lock)
                     else:
-                        observer.observe(direction, bytes(pending))
+                        observer.observe(direction, payload)
                         if target_channel is not None:
-                            target_channel.write(pending)
+                            target_channel.write(payload)
                         else:
-                            _raw_write(target_fd, pending, target_lock)
-                    pending.clear()
+                            _raw_write(target_fd, payload, target_lock)
                 if on_eof is not None:
                     on_eof()
                 return
@@ -1120,10 +1140,7 @@ def proxy_mcp_stdio(
                 creationflags=creationflags,
             )
             if os.name != "nt":
-                try:
-                    process_group = os.getpgid(process.pid)
-                except ProcessLookupError:
-                    process_group = None
+                process_group = process.pid
             try:
                 job = _WindowsJob(process)
             except OSError:
@@ -1146,8 +1163,8 @@ def proxy_mcp_stdio(
             process.stdin.fileno(), threading.Lock(), threading.Event()
         )
 
-        def close_child_stdin() -> None:
-            child_stdin.close(process.stdin)
+        def close_child_stdin(timeout: float | None = None) -> bool:
+            return child_stdin.close(process.stdin, timeout)
 
         def client_closed() -> None:
             client_eof.set()
@@ -1219,20 +1236,29 @@ def proxy_mcp_stdio(
                 if time.monotonic() >= eof_deadline:
                     proxy_cleanup = True
                     shutdown_reason = "client_eof_grace_expired"
-                    observer.mark_unobserved("client_disconnected")
+                    observer.mark_incomplete("client_disconnected")
                     break
             shutdown.wait(POLL_SECONDS)
 
         if not child_exited and (proxy_cleanup or failures or caught_signal is not None):
             _terminate_tree(process, job, process_group)
             tree_terminated = True
-        close_child_stdin()
+        if not close_child_stdin(PROCESS_TERM_GRACE_SECONDS):
+            proxy_cleanup = True
+            shutdown_reason = "client_stdin_close_grace_expired"
+            observer.mark_incomplete("client_relay_blocked")
+            shutdown.set()
+            if not tree_terminated:
+                _terminate_tree(process, job, process_group)
+                tree_terminated = True
+            client_done.wait(PROCESS_TERM_GRACE_SECONDS)
+            close_child_stdin(PROCESS_TERM_GRACE_SECONDS)
         stdout_done.wait(PROCESS_TERM_GRACE_SECONDS)
         stderr_done.wait(PROCESS_TERM_GRACE_SECONDS)
         if not stdout_done.is_set() or not stderr_done.is_set():
             proxy_cleanup = True
             shutdown_reason = "descendant_grace_expired"
-            observer.mark_unobserved("descendant_cleanup")
+            observer.mark_incomplete("descendant_cleanup")
             if not tree_terminated:
                 _terminate_tree(process, job, process_group)
                 tree_terminated = True
@@ -1261,11 +1287,10 @@ def proxy_mcp_stdio(
     finished_at = utc_now()
     duration_ms = max(0, int((time.monotonic() - started) * 1000))
     if not client_done.is_set():
-        observer.mark_unobserved("client_relay_unfinished")
+        observer.mark_incomplete("client_relay_unfinished")
     if process is not None and not stdout_done.is_set():
-        observer.mark_unobserved("server_relay_unfinished")
-    seal_reason = "client_disconnected" if proxy_cleanup else None
-    events, observation = observer.seal(seal_reason)
+        observer.mark_incomplete("server_relay_unfinished")
+    events, observation = observer.seal()
     incomplete_inflight = bool(observer.in_flight) and bool(observation["complete"])
     exit_code = _proxy_exit_code(
         caught_signal,
@@ -1359,6 +1384,18 @@ def proxy_mcp_stdio(
         child_exited,
         raw_child_code,
     )
+    if failures and failures[-1] == "mcp_store_unwritable":
+        trace["status"] = "failed"
+        trace["exit_code"] = exit_code
+        metadata["shutdown_reason"] = "mcp_store_unwritable"
+        finished_event = events[-1]
+        if isinstance(finished_event, dict):
+            finished_event["data"] = {
+                "status": "failed",
+                "exit_code": exit_code,
+                "timed_out": False,
+                "duration_ms": duration_ms,
+            }
 
     if failures:
         _write_diagnostic(stderr_fd, stderr_lock, stderr_last, failures[0], stderr_done.is_set())
