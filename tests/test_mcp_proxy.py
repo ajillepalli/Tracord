@@ -1095,6 +1095,41 @@ def test_diagnostic_newline_policy_and_exit_mapping(
     assert mcp_proxy._mapped_exit_code(None) == 1
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [(ProcessLookupError(), None), (PermissionError(), 4321)],
+)
+def test_process_group_capture_has_safe_error_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: OSError,
+    expected: int | None,
+) -> None:
+    class Process:
+        pid = 4321
+
+    def fail(_pid: int) -> int:
+        raise failure
+
+    monkeypatch.setattr(mcp_proxy.os, "getpgid", fail, raising=False)
+    assert mcp_proxy._capture_process_group(Process()) == expected  # type: ignore[arg-type]
+
+
+def test_leader_fallback_escalates_without_waiting_or_reaping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        pid = 4321
+
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(mcp_proxy.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(mcp_proxy.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(mcp_proxy, "PROCESS_TERM_GRACE_SECONDS", 0)
+
+    mcp_proxy._terminate_leader_without_reaping(Process())  # type: ignore[arg-type]
+
+    assert signals == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows launcher policy")
 def test_windows_rejects_cwd_hijacking_and_batch_launchers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

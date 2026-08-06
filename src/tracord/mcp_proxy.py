@@ -859,6 +859,35 @@ class _WindowsJob:
             self._kernel32 = None
 
 
+def _capture_process_group(process: subprocess.Popen[bytes]) -> int | None:
+    try:
+        return os.getpgid(process.pid)
+    except ProcessLookupError:
+        return None
+    except OSError:
+        return process.pid
+
+
+def _terminate_leader_without_reaping(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.kill(process.pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.monotonic() + PROCESS_TERM_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            os.kill(process.pid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            return
+        time.sleep(POLL_SECONDS)
+    try:
+        os.kill(process.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def _terminate_tree(
     process: subprocess.Popen[bytes],
     job: _WindowsJob | None,
@@ -890,10 +919,7 @@ def _terminate_tree(
     except ProcessLookupError:
         return
     except PermissionError:
-        try:
-            process.terminate()
-        except OSError:
-            pass
+        _terminate_leader_without_reaping(process)
         return
     deadline = time.monotonic() + PROCESS_TERM_GRACE_SECONDS
     while time.monotonic() < deadline:
@@ -902,6 +928,7 @@ def _terminate_tree(
         except ProcessLookupError:
             break
         except PermissionError:
+            _terminate_leader_without_reaping(process)
             return
         time.sleep(POLL_SECONDS)
     try:
@@ -910,7 +937,7 @@ def _terminate_tree(
         pass
     except PermissionError:
         try:
-            process.kill()
+            os.kill(process.pid, signal.SIGKILL)
         except OSError:
             pass
     try:
@@ -1153,10 +1180,7 @@ def proxy_mcp_stdio(
                 creationflags=creationflags,
             )
             if os.name != "nt":
-                try:
-                    process_group = os.getpgid(process.pid)
-                except ProcessLookupError:
-                    process_group = process.pid
+                process_group = _capture_process_group(process)
             try:
                 job = _WindowsJob(process)
             except OSError:
