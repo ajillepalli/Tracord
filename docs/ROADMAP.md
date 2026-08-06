@@ -20,7 +20,7 @@ Tracord is pre-1.0. The roadmap is intentionally biased toward reliability primi
 ## v0.3
 
 - Tool-call event schema. (implemented)
-- MCP proxy recording prototype.
+- MCP stdio proxy recording prototype. (implemented)
 - Approval and permission events.
 - Policy checks for unsafe tool use.
 

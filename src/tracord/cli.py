@@ -39,6 +39,7 @@ from .export_preview import (
     preview_export,
 )
 from .git_capture import DEFAULT_GIT_TIMEOUT_SECONDS, DEFAULT_MAX_DIFF_BYTES
+from .mcp_proxy import McpProxyError, proxy_mcp_stdio
 from .recorder import RecordError, record_command
 from .redaction import sanitize_label
 from .replay import ReplayError, replay_run
@@ -53,8 +54,23 @@ from .trace_access import TraceAccessError, load_trace
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    if raw_argv and raw_argv[0] == "mcp-proxy":
+        try:
+            separator = raw_argv.index("--")
+        except ValueError:
+            if any(option in {"-h", "--help"} for option in raw_argv[1:]):
+                args = parser.parse_args(raw_argv)
+                return args.handler(args)
+            parser.error("mcp-proxy requires -- before the server command")
+        server_command = raw_argv[separator + 1 :]
+        if not server_command:
+            parser.error("mcp-proxy requires a server command after --")
+        args = parser.parse_args(raw_argv[:separator])
+        args.server_command = server_command
+    else:
+        args = parser.parse_args(raw_argv)
     return args.handler(args)
 
 
@@ -222,7 +238,34 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("run_id", help="run id to replay")
     replay.set_defaults(handler=handle_replay)
 
+    mcp_proxy = subparsers.add_parser(
+        "mcp-proxy", help="proxy an MCP stdio server and record tool calls"
+    )
+    mcp_proxy.add_argument("--store", default=DEFAULT_HOME, help="trace store directory")
+    mcp_proxy.add_argument("--name", help="human-readable run name")
+    mcp_proxy.add_argument(
+        "--tool-data",
+        choices=["omitted", "redacted", "captured"],
+        default="omitted",
+        help="tool input/output capture policy",
+    )
+    mcp_proxy.set_defaults(handler=handle_mcp_proxy)
+
     return parser
+
+
+def handle_mcp_proxy(args: argparse.Namespace) -> int:
+    try:
+        result = proxy_mcp_stdio(
+            list(args.server_command),
+            root=Path(args.store),
+            name=args.name,
+            tool_data=args.tool_data,
+        )
+    except McpProxyError as exc:
+        print(f"tracord: mcp-proxy failed: {exc.code}", file=sys.stderr)
+        return 1
+    return result.exit_code
 
 
 def handle_record(args: argparse.Namespace) -> int:

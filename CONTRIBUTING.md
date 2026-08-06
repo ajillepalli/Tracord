@@ -75,6 +75,7 @@ Use the PR template checklist. Review concerns are blocking unless they are expl
 src/tracord/              # CLI and core recording code
   cli.py                  # argparse command surface
   recorder.py             # command execution and trace writing
+  mcp_proxy.py            # byte-transparent MCP stdio relay and observation
   storage.py              # local run directory helpers
   schema.py               # lightweight trace validation
   assertions.py           # deterministic assertion evaluation

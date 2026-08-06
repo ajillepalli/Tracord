@@ -90,6 +90,20 @@ Capture a before/after Git diff only when you need it, because patches can conta
 tracord record --capture-diff -- python agent.py
 ```
 
+Proxy a local MCP stdio server to record its tool-call lifecycle while keeping
+the protocol stream on stdout:
+
+```bash
+tracord mcp-proxy --name local-tools -- python path/to/server.py
+tracord list
+```
+
+Tool inputs and outputs are omitted by default. Use `--tool-data redacted` for
+best-effort redaction, or `--tool-data captured` only when storing raw protocol
+values is acceptable. Point an MCP client at the full `tracord mcp-proxy -- ...`
+command in place of the server command. See the [MCP stdio proxy guide](docs/mcp-stdio-proxy.md)
+for configuration, privacy choices, observation limits, and shutdown behavior.
+
 Repository-owned assertion cases live in `.tracord/assertions.json`. See the [assertion schema](schemas/assertions-v0.schema.json) for the file format and [Contributing](CONTRIBUTING.md) for the test setup.
 
 ## Documentation
@@ -103,6 +117,7 @@ Repository-owned assertion cases live in `.tracord/assertions.json`. See the [as
 | [CI JSON output](docs/ci-json-output.md) | Core command result schemas, wire behavior, privacy, and list completeness |
 | [Bundle v0](docs/bundle-v0.md) | Export, import, preview, replay, and archive safety |
 | [File diff capture](docs/file-diff-capture.md) | Git capture model, privacy behavior, and limits |
+| [MCP stdio proxy](docs/mcp-stdio-proxy.md) | Local proxy setup, capture modes, limits, and lifecycle behavior |
 | [Roadmap](docs/ROADMAP.md) | Planned releases and open product questions |
 | [Changelog](CHANGELOG.md) | Notable shipped and unreleased changes |
 | [Contributing](CONTRIBUTING.md) | Development setup, tests, workflow, and repository layout |

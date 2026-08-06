@@ -4,25 +4,22 @@ from __future__ import annotations
 
 import locale
 import os
-import stat
 import subprocess
 import time
 import uuid
 from datetime import UTC, datetime
-from os import stat_result
 from pathlib import Path
 
 from .git_capture import DEFAULT_GIT_TIMEOUT_SECONDS, DEFAULT_MAX_DIFF_BYTES, GitDiffCapture
-from .paths import IdentityComparison, compare_identity, is_link_or_junction
 from .redaction import redact_text
 from .schema import SCHEMA_VERSION
 from .storage import (
-    PreparedStore,
+    PreparedRun,
     StoreSafetyError,
-    prepare_store_for_write,
-    run_dir,
-    verify_prepared_store,
-    write_json,
+    prepare_run_for_write,
+    publish_prepared_json,
+    verify_prepared_run,
+    write_prepared_bytes,
 )
 
 
@@ -62,22 +59,12 @@ def record_command(
     if not command:
         raise RecordError("record_command_required")
 
-    try:
-        prepared_store = prepare_store_for_write(root)
-    except (OSError, StoreSafetyError):
-        raise RecordError("record_store_unwritable") from None
-
     run_id = new_run_id()
-    output_dir = run_dir(root, run_id)
     try:
-        if not verify_prepared_store(prepared_store):
-            raise StoreSafetyError("changed")
-        output_dir.mkdir(exist_ok=False)
-        output_snapshot = _directory_snapshot(output_dir)
-        if not verify_prepared_store(prepared_store):
-            raise StoreSafetyError("changed")
+        prepared_run = prepare_run_for_write(root, run_id)
     except (OSError, StoreSafetyError):
         raise RecordError("record_store_unwritable") from None
+    output_dir = prepared_run.path
 
     working_directory = Path.cwd()
     cwd = str(working_directory)
@@ -159,10 +146,10 @@ def record_command(
         )
 
         try:
-            _require_store_identity(prepared_store, output_dir, output_snapshot)
-            (output_dir / STDOUT_ARTIFACT).write_bytes(stored_stdout.encode("utf-8"))
-            _require_store_identity(prepared_store, output_dir, output_snapshot)
-            (output_dir / STDERR_ARTIFACT).write_bytes(stored_stderr.encode("utf-8"))
+            _require_store_identity(prepared_run)
+            write_prepared_bytes(prepared_run, STDOUT_ARTIFACT, stored_stdout.encode("utf-8"))
+            _require_store_identity(prepared_run)
+            write_prepared_bytes(prepared_run, STDERR_ARTIFACT, stored_stderr.encode("utf-8"))
         except (OSError, StoreSafetyError):
             raise RecordError("record_store_unwritable") from None
 
@@ -205,16 +192,16 @@ def record_command(
                 "stdout": stdout_replacement,
                 "stderr": stderr_replacement,
             },
-            "store_identity_verified": prepared_store.identity_verified,
+            "store_identity_verified": prepared_run.store.identity_verified,
             "artifacts": artifacts,
             "events": events,
         }
         if file_changes is not None:
             trace["file_changes"] = file_changes
         try:
-            _require_store_identity(prepared_store, output_dir, output_snapshot)
-            write_json(output_dir / "trace.json", trace)
-            _require_store_identity(prepared_store, output_dir, output_snapshot)
+            _require_store_identity(prepared_run)
+            publish_prepared_json(prepared_run, "trace.json", trace)
+            _require_store_identity(prepared_run)
         except (OSError, StoreSafetyError):
             raise RecordError("record_store_unwritable") from None
         return trace
@@ -246,23 +233,6 @@ def _normalize_newlines(value: str) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _directory_snapshot(path: Path) -> stat_result:
-    snapshot = path.lstat()
-    if is_link_or_junction(path, snapshot) or not stat.S_ISDIR(snapshot.st_mode):
+def _require_store_identity(run: PreparedRun) -> None:
+    if not verify_prepared_run(run):
         raise StoreSafetyError("changed")
-    return snapshot
-
-
-def _require_store_identity(
-    store: PreparedStore,
-    output_dir: Path,
-    output_snapshot: stat_result,
-) -> None:
-    if not verify_prepared_store(store):
-        raise StoreSafetyError("changed")
-    current_output = _directory_snapshot(output_dir)
-    output_identity = compare_identity(output_snapshot, current_output)
-    if output_identity is IdentityComparison.DIFFERENT:
-        raise StoreSafetyError("changed")
-    if store.identity_verified and output_identity is not IdentityComparison.VERIFIED:
-        raise StoreSafetyError("identity_unverifiable")
