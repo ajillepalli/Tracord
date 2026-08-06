@@ -14,6 +14,7 @@ import pytest
 from tracord import cli
 from tracord import mcp_proxy
 from tracord.mcp_proxy import ProxyResult
+from tracord.run_listing import scan_runs
 from tracord.schema import validate_trace
 
 
@@ -122,6 +123,16 @@ def test_cli_requires_separator_and_child_before_creating_store(
         cli.main([*argv[:1], "--store", str(tmp_path / "store"), *argv[1:]])
     assert exc_info.value.code == 2
     assert not (tmp_path / "store").exists()
+
+
+def test_cli_help_does_not_require_server_separator(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["mcp-proxy", "--help"])
+
+    assert exc_info.value.code == 0
+    assert "usage: tracord mcp-proxy" in capsys.readouterr().out
 
 
 def test_proxy_forwards_lifecycle_and_records_outcomes(tmp_path: Path) -> None:
@@ -371,7 +382,11 @@ def test_spawn_failure_publishes_a_path_free_failed_trace(tmp_path: Path) -> Non
     assert len(traces) == 1
     trace = json.loads(traces[0].read_text(encoding="utf-8"))
     assert trace["status"] == "failed"
+    assert trace["exit_code"] == 1
     assert trace["mcp_proxy"]["shutdown_reason"] == "mcp_spawn_failed"
+    listing = scan_runs(store)
+    assert len(listing.runs) == 1
+    assert listing.skipped == 0
 
 
 def test_raw_framing_is_byte_identical(tmp_path: Path) -> None:
@@ -695,6 +710,7 @@ def test_complete_observation_with_unfinished_call_fails(tmp_path: Path) -> None
 
     assert completed.returncode == 1
     assert trace["status"] == "failed"
+    assert trace["exit_code"] == 1
     assert trace["mcp_proxy"]["observation"]["complete"] is True
     assert [event["type"] for event in tool_events(trace)] == ["tool.call.started"]
 
@@ -890,6 +906,41 @@ def test_trace_trimming_uses_bounded_serialization(
     assert encode_calls <= 12
     assert len(original_encode(trace)) <= target_size
     assert observer.events_dropped == 256
+
+
+def test_oversized_trace_fallback_remains_listable() -> None:
+    observer = mcp_proxy._Observer("omitted", "2026-08-05T00:00:00Z", ["server"], ".")
+    events: list[dict[str, object]] = [
+        {"type": "command.started", "data": {}},
+        {"type": "tool.call.started", "data": {"call_id": "call-1"}},
+        {"type": "tool.call.finished", "data": {"call_id": "call-1"}},
+        {"type": "command.finished", "data": {"status": "passed", "exit_code": 0}},
+    ]
+    metadata: dict[str, object] = {"shutdown_reason": "child_exit"}
+    trace: dict[str, object] = {
+        "status": "passed",
+        "exit_code": 0,
+        "events": events,
+        "mcp_proxy": metadata,
+    }
+
+    mcp_proxy._collapse_oversized_trace(
+        trace,
+        observer,
+        code="mcp_trace_too_large",
+        exit_code=1,
+        duration_ms=12,
+    )
+
+    assert trace["status"] == "failed"
+    assert trace["exit_code"] == 1
+    assert metadata["shutdown_reason"] == "mcp_trace_too_large"
+    assert [event["type"] for event in events] == [
+        "command.started",
+        "command.finished",
+    ]
+    assert events[-1]["data"]["exit_code"] == 1
+    assert observer.events_dropped == 2
 
 
 def test_standard_fd_failure_happens_before_store_creation(

@@ -911,6 +911,27 @@ def _mapped_exit_code(raw: int | None) -> int:
     return 1 if raw != 0 and mapped == 0 else mapped
 
 
+def _proxy_exit_code(
+    caught_signal: int | None,
+    failures: list[str],
+    incomplete_inflight: bool,
+    proxy_cleanup: bool,
+    raw_child_code: int | None,
+) -> int:
+    if caught_signal is not None:
+        signal_codes = {signal.SIGINT: 130}
+        if hasattr(signal, "SIGTERM"):
+            signal_codes[signal.SIGTERM] = 143
+        if hasattr(signal, "SIGHUP"):
+            signal_codes[signal.SIGHUP] = 129
+        return signal_codes.get(caught_signal, 1)
+    if failures or incomplete_inflight:
+        return 1
+    if proxy_cleanup:
+        return 0
+    return _mapped_exit_code(raw_child_code)
+
+
 def _trim_trace(trace: dict[str, object], observer: _Observer) -> None:
     def encoded_size() -> int:
         return len(encode_prepared_json(trace))
@@ -985,6 +1006,44 @@ def _trim_trace(trace: dict[str, object], observer: _Observer) -> None:
     removed = len(original_events) - len(kept_events)
     events[:] = kept_events
     observer.record_dropped_events(removed)
+
+
+def _collapse_oversized_trace(
+    trace: dict[str, object],
+    observer: _Observer,
+    *,
+    code: str,
+    exit_code: int,
+    duration_ms: int,
+) -> None:
+    events = trace["events"]
+    metadata = trace["mcp_proxy"]
+    assert isinstance(events, list)
+    assert isinstance(metadata, dict)
+    trace["status"] = "failed"
+    trace["exit_code"] = exit_code
+    metadata["shutdown_reason"] = code
+    started_event = next(
+        (
+            event
+            for event in events
+            if isinstance(event, dict) and event.get("type") == "command.started"
+        ),
+        None,
+    )
+    finished_event = events[-1]
+    if isinstance(finished_event, dict):
+        finished_event["data"] = {
+            "status": "failed",
+            "exit_code": exit_code,
+            "timed_out": False,
+            "duration_ms": duration_ms,
+        }
+    retained_events = [
+        event for event in (started_event, finished_event) if event is not None
+    ]
+    observer.record_dropped_events(len(events) - len(retained_events))
+    events[:] = retained_events
 
 
 def proxy_mcp_stdio(
@@ -1203,22 +1262,22 @@ def proxy_mcp_stdio(
         observer.mark_unobserved("server_relay_unfinished")
     seal_reason = "client_disconnected" if proxy_cleanup else None
     events, observation = observer.seal(seal_reason)
-    independent_child_failure = raw_child_code not in {None, 0} and not proxy_cleanup
     incomplete_inflight = bool(observer.in_flight) and bool(observation["complete"])
-    failed = bool(failures or caught_signal or independent_child_failure or incomplete_inflight)
-    status = "failed" if failed else "passed"
-    top_exit = (
-        None
-        if raw_child_code is None
-        else (0 if proxy_cleanup and not failures else raw_child_code)
+    exit_code = _proxy_exit_code(
+        caught_signal,
+        failures,
+        incomplete_inflight,
+        proxy_cleanup,
+        raw_child_code,
     )
+    status = "passed" if exit_code == 0 else "failed"
     events.append(
         {
             "type": "command.finished",
             "at": finished_at,
             "data": {
                 "status": status,
-                "exit_code": top_exit,
+                "exit_code": exit_code,
                 "timed_out": False,
                 "duration_ms": duration_ms,
             },
@@ -1250,7 +1309,7 @@ def proxy_mcp_stdio(
         "finished_at": finished_at,
         "duration_ms": duration_ms,
         "timeout_seconds": None,
-        "exit_code": top_exit,
+        "exit_code": exit_code,
         "timed_out": False,
         "redacted": tool_data == "redacted" or stored_command != command,
         "store_identity_verified": prepared.store.identity_verified,
@@ -1260,29 +1319,39 @@ def proxy_mcp_stdio(
     }
     try:
         _trim_trace(trace, observer)
+    except McpProxyError as exc:
+        failures.append(exc.code)
+        shutdown_reason = exc.code
+        exit_code = _proxy_exit_code(
+            caught_signal,
+            failures,
+            incomplete_inflight,
+            proxy_cleanup,
+            raw_child_code,
+        )
+        _collapse_oversized_trace(
+            trace,
+            observer,
+            code=exc.code,
+            exit_code=exit_code,
+            duration_ms=duration_ms,
+        )
+    try:
         observation = observer.snapshot_observation()
         metadata["observation"] = observation
         write_prepared_bytes(prepared, STDOUT_ARTIFACT, b"")
         write_prepared_bytes(prepared, STDERR_ARTIFACT, b"")
         publish_prepared_json(prepared, "trace.json", trace)
-    except (McpProxyError, StoreSafetyError):
+    except StoreSafetyError:
         failures.append("mcp_store_unwritable")
 
-    if caught_signal is not None:
-        signal_codes = {signal.SIGINT: 130}
-        if hasattr(signal, "SIGTERM"):
-            signal_codes[signal.SIGTERM] = 143
-        if hasattr(signal, "SIGHUP"):
-            signal_codes[signal.SIGHUP] = 129
-        exit_code = signal_codes.get(caught_signal, 1)
-    elif failures:
-        exit_code = 1
-    elif incomplete_inflight:
-        exit_code = 1
-    elif proxy_cleanup:
-        exit_code = 0
-    else:
-        exit_code = _mapped_exit_code(raw_child_code)
+    exit_code = _proxy_exit_code(
+        caught_signal,
+        failures,
+        incomplete_inflight,
+        proxy_cleanup,
+        raw_child_code,
+    )
 
     if failures:
         _write_diagnostic(stderr_fd, stderr_lock, stderr_last, failures[0], stderr_done.is_set())

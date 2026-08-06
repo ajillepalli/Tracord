@@ -33,12 +33,18 @@ def replay_run(
     except TraceAccessError as exc:
         raise ReplayError(_replay_access_code(exc.code)) from None
 
+    if "mcp_proxy" in trace:
+        raise ReplayError("replay_trace_invalid")
     command = trace.get("command")
     if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
         raise ReplayError("replay_trace_invalid")
 
     replay_name = name if name is not None else f"replay of {run_id}"
-    timeout = timeout_seconds if timeout_seconds is not None else _timeout(trace.get("timeout_seconds"))
+    timeout = (
+        timeout_seconds
+        if timeout_seconds is not None
+        else _timeout(trace.get("timeout_seconds"))
+    )
     try:
         return record_command(
             command,

@@ -60,6 +60,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             separator = raw_argv.index("--")
         except ValueError:
+            if any(option in {"-h", "--help"} for option in raw_argv[1:]):
+                args = parser.parse_args(raw_argv)
+                return args.handler(args)
             parser.error("mcp-proxy requires -- before the server command")
         server_command = raw_argv[separator + 1 :]
         if not server_command:

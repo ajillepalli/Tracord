@@ -52,3 +52,18 @@ def test_replay_rejects_trace_directory_identity_mismatch(tmp_path: Path) -> Non
     with pytest.raises(ReplayError) as exc_info:
         replay_run(root=store, run_id=original_id)
     assert exc_info.value.code == "replay_run_identity_mismatch"
+
+
+def test_replay_rejects_mcp_proxy_trace(tmp_path: Path) -> None:
+    store = tmp_path / ".tracord"
+    original = record_command([sys.executable, "-c", "pass"], root=store)
+    original_id = str(original["run_id"])
+    trace_path = run_dir(store, original_id) / "trace.json"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    trace["mcp_proxy"] = {}
+    trace_path.write_text(json.dumps(trace), encoding="utf-8")
+
+    with pytest.raises(ReplayError) as exc_info:
+        replay_run(root=store, run_id=original_id)
+
+    assert exc_info.value.code == "replay_trace_invalid"

@@ -28,7 +28,8 @@ use a shell or search the current directory for a bare executable name.
 
 The proxy writes no success summary because stdout belongs exclusively to MCP.
 Use `tracord list` to find the resulting run and `tracord inspect <run-id>` to
-read its trace.
+read its trace. Proxy traces are not replayable because replaying a server
+without its MCP client would not reproduce the recorded exchange.
 
 ## Choose a capture policy
 
@@ -69,3 +70,7 @@ its process tree. SIGINT, and SIGTERM/SIGHUP on POSIX, use the same bounded
 finalization path. An independently observed child failure is returned to the
 client. Cleanup initiated after client disconnect does not invent a child
 failure, but observation is marked incomplete.
+
+The trace's top-level `exit_code` is the Tracord proxy process result so failed
+runs remain valid list entries. The server's unmodified result is retained as
+`mcp_proxy.raw_child_exit_code`.

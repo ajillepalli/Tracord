@@ -6,7 +6,7 @@ The format is based on Keep a Changelog, and this project will follow semantic v
 
 ## [Unreleased]
 
-## [0.1.0.0] - 2026-08-05
+## [0.1.0] - 2026-08-05
 
 - Created initial repository scaffold.
 - Added minimal Python CLI for recording, listing, and inspecting local command runs.
