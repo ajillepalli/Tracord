@@ -917,9 +917,11 @@ def _trim_trace(trace: dict[str, object], observer: _Observer) -> None:
 
     events = trace["events"]
     assert isinstance(events, list)
+    if encoded_size() <= TRACE_TARGET_BYTES:
+        return
+
+    omitted = 0
     for event in reversed(events):
-        if encoded_size() <= TRACE_TARGET_BYTES:
-            return
         if not isinstance(event, dict):
             continue
         data = event.get("data")
@@ -929,32 +931,60 @@ def _trim_trace(trace: dict[str, object], observer: _Observer) -> None:
         if isinstance(capture, dict) and capture.get("capture") != "omitted":
             capture.clear()
             capture["capture"] = "omitted"
-            observer.record_final_size_omission()
-    while encoded_size() > TRACE_TARGET_BYTES:
-        tool_index = next(
-            (
-                index
-                for index, event in enumerate(events)
-                if isinstance(event, dict)
-                and str(event.get("type", "")).startswith("tool.call.")
-            ),
-            None,
-        )
-        if tool_index is None:
-            raise McpProxyError("mcp_trace_too_large")
-        event = events[tool_index]
-        event_data = event.get("data")
-        call_id = event_data.get("call_id") if isinstance(event_data, dict) else None
-        kept: list[object] = []
-        removed = 0
-        for item in events:
-            data = item.get("data") if isinstance(item, dict) else None
-            if isinstance(data, dict) and data.get("call_id") == call_id:
-                removed += 1
-            else:
-                kept.append(item)
-        events[:] = kept
-        observer.record_dropped_events(removed)
+            omitted += 1
+    for _ in range(omitted):
+        observer.record_final_size_omission()
+    if encoded_size() <= TRACE_TARGET_BYTES:
+        return
+
+    call_ids: list[str] = []
+    seen_call_ids: set[str] = set()
+    for event in events:
+        if not isinstance(event, dict) or not str(event.get("type", "")).startswith(
+            "tool.call."
+        ):
+            continue
+        data = event.get("data")
+        call_id = data.get("call_id") if isinstance(data, dict) else None
+        if isinstance(call_id, str) and call_id not in seen_call_ids:
+            call_ids.append(call_id)
+            seen_call_ids.add(call_id)
+    if not call_ids:
+        raise McpProxyError("mcp_trace_too_large")
+
+    original_events = list(events)
+
+    def without_call_prefix(count: int) -> list[object]:
+        dropped_ids = set(call_ids[:count])
+        return [
+            event
+            for event in original_events
+            if not (
+                isinstance(event, dict)
+                and isinstance(event.get("data"), dict)
+                and event["data"].get("call_id") in dropped_ids
+            )
+        ]
+
+    smallest_fit: tuple[int, list[object]] | None = None
+    low, high = 1, len(call_ids)
+    while low <= high:
+        middle = (low + high) // 2
+        candidate_events = without_call_prefix(middle)
+        candidate_trace = dict(trace)
+        candidate_trace["events"] = candidate_events
+        if len(encode_prepared_json(candidate_trace)) <= TRACE_TARGET_BYTES:
+            smallest_fit = middle, candidate_events
+            high = middle - 1
+        else:
+            low = middle + 1
+    if smallest_fit is None:
+        raise McpProxyError("mcp_trace_too_large")
+
+    _count, kept_events = smallest_fit
+    removed = len(original_events) - len(kept_events)
+    events[:] = kept_events
+    observer.record_dropped_events(removed)
 
 
 def proxy_mcp_stdio(

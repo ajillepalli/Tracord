@@ -855,6 +855,43 @@ def test_trace_trimming_omits_captures_then_complete_call_pairs(
     assert observer.events_dropped >= 2
 
 
+def test_trace_trimming_uses_bounded_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[dict[str, object]] = [{"type": "command.started", "data": {}}]
+    for index in range(256):
+        call_id = f"call-{index}"
+        events.extend(
+            [
+                {
+                    "type": "tool.call.started",
+                    "data": {"call_id": call_id, "payload": "x" * 100},
+                },
+                {"type": "tool.call.finished", "data": {"call_id": call_id}},
+            ]
+        )
+    trace: dict[str, object] = {"events": events}
+    target_trace = {"events": [events[0], *events[257:]]}
+    target_size = len(mcp_proxy.encode_prepared_json(target_trace))
+    monkeypatch.setattr(mcp_proxy, "TRACE_TARGET_BYTES", target_size)
+
+    encode_calls = 0
+    original_encode = mcp_proxy.encode_prepared_json
+
+    def counted_encode(value: object) -> bytes:
+        nonlocal encode_calls
+        encode_calls += 1
+        return original_encode(value)
+
+    monkeypatch.setattr(mcp_proxy, "encode_prepared_json", counted_encode)
+    observer = mcp_proxy._Observer("omitted", "2026-08-05T00:00:00Z", ["server"], ".")
+    mcp_proxy._trim_trace(trace, observer)
+
+    assert encode_calls <= 12
+    assert len(original_encode(trace)) <= target_size
+    assert observer.events_dropped == 256
+
+
 def test_standard_fd_failure_happens_before_store_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
