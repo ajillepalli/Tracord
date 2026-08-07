@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tracord"
-version = "0.1.1.0"
+version = "0.1.2.0"
 description = "Local-first flight recorder for agentic software."
 readme = "README.md"
 requires-python = ">=3.11"

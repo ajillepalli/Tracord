@@ -1,3 +1,3 @@
 """Tracord records and inspects local agent run evidence."""
 
-__version__ = "0.1.1.0"
+__version__ = "0.1.2.0"
