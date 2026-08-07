@@ -184,6 +184,8 @@ def test_proxy_forwards_lifecycle_and_records_outcomes(tmp_path: Path) -> None:
     }
     assert trace["status"] == "passed"
     assert trace["mcp_proxy"]["observation"]["complete"] is True
+    assert trace["mcp_proxy"]["observation_queue_limit_bytes"] == 2_097_154
+    assert trace["mcp_proxy"]["observation_queue_limit_messages"] == 64
     assert validate_trace(trace) == []
     assert (run_dir / "stdout.log").read_bytes() == b""
     assert (run_dir / "stderr.log").read_bytes() == b""
@@ -445,6 +447,502 @@ def test_observation_buffer_stops_at_limit_plus_one(
     assert writes == [b"abcde", b"fghijkl"]
     assert failures == []
     assert observer.unobserved_messages == 1
+
+
+def test_relay_forwards_near_limit_message_while_observer_is_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = message(
+        1,
+        "tools/call",
+        {"name": "echo", "arguments": {"padding": "x" * 900_000}},
+    )
+    reads = iter([payload, b""])
+    writes: list[bytes] = []
+    observing = mcp_proxy.threading.Event()
+    release = mcp_proxy.threading.Event()
+    observer = mcp_proxy._Observer(
+        "redacted", "2026-08-06T00:00:00Z", ["server"], "."
+    )
+    original_observe = observer.observe
+
+    def blocked_observe(
+        direction: mcp_proxy.Direction, raw: bytes, **timing: object
+    ) -> None:
+        observing.set()
+        assert release.wait(5)
+        original_observe(direction, raw, **timing)  # type: ignore[arg-type]
+
+    observer.observe = blocked_observe  # type: ignore[method-assign]
+    worker = mcp_proxy._ObservationWorker(observer)
+    monkeypatch.setattr(mcp_proxy, "_raw_read", lambda _fd: next(reads))
+    monkeypatch.setattr(
+        mcp_proxy,
+        "_raw_write",
+        lambda _fd, data, _lock: writes.append(bytes(data)),
+    )
+    try:
+        mcp_proxy._relay_messages(
+            0,
+            1,
+            mcp_proxy.threading.Lock(),
+            worker,
+            "client",
+            mcp_proxy.threading.Event(),
+            [],
+            mcp_proxy.threading.Event(),
+        )
+
+        assert observing.wait(5)
+        assert writes == [payload]
+        assert not release.is_set()
+    finally:
+        release.set()
+        worker.close()
+
+
+def test_bidirectional_relay_preserves_causal_observation_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = message(
+        7,
+        "tools/call",
+        {"name": "echo", "arguments": {"padding": "x" * 900_000}},
+    )
+    response = (
+        json.dumps(
+            {"jsonrpc": "2.0", "id": 7, "result": {"padding": "y" * 900_000}},
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+    request_forwarded = mcp_proxy.threading.Event()
+    first_observation = mcp_proxy.threading.Event()
+    release = mcp_proxy.threading.Event()
+    read_counts = {10: 0, 20: 0}
+    writes: dict[int, list[bytes]] = {11: [], 21: []}
+    queued_before_forward: dict[int, list[bool]] = {11: [], 21: []}
+
+    def read(fd: int) -> bytes:
+        read_counts[fd] += 1
+        if fd == 10:
+            return request if read_counts[fd] == 1 else b""
+        if read_counts[fd] == 1:
+            assert request_forwarded.wait(5)
+            return response
+        return b""
+
+    def write(fd: int, data: bytes, _lock: object) -> None:
+        writes[fd].append(bytes(data))
+        if fd in queued_before_forward:
+            with worker.condition:
+                expected_items = 1 if fd == 11 else 2
+                queued_before_forward[fd].append(
+                    worker.outstanding_items >= expected_items
+                )
+        if fd == 11:
+            request_forwarded.set()
+
+    observer = mcp_proxy._Observer(
+        "redacted", "2026-08-06T00:00:00Z", ["server"], "."
+    )
+    original_observe = observer.observe
+
+    def blocked_first(
+        direction: mcp_proxy.Direction, raw: bytes, **timing: object
+    ) -> None:
+        if not first_observation.is_set():
+            first_observation.set()
+            assert release.wait(5)
+        original_observe(direction, raw, **timing)  # type: ignore[arg-type]
+
+    observer.observe = blocked_first  # type: ignore[method-assign]
+    worker = mcp_proxy._ObservationWorker(observer)
+    monkeypatch.setattr(mcp_proxy, "_raw_read", read)
+    monkeypatch.setattr(mcp_proxy, "_raw_write", write)
+    done = [mcp_proxy.threading.Event(), mcp_proxy.threading.Event()]
+    failures: list[str] = []
+    shutdown = mcp_proxy.threading.Event()
+    relays = [
+        mcp_proxy.threading.Thread(
+            target=mcp_proxy._relay_messages,
+            args=(
+                10,
+                11,
+                mcp_proxy.threading.Lock(),
+                worker,
+                "client",
+                done[0],
+                failures,
+                shutdown,
+            ),
+        ),
+        mcp_proxy.threading.Thread(
+            target=mcp_proxy._relay_messages,
+            args=(
+                20,
+                21,
+                mcp_proxy.threading.Lock(),
+                worker,
+                "server",
+                done[1],
+                failures,
+                shutdown,
+            ),
+        ),
+    ]
+    try:
+        for relay in relays:
+            relay.start()
+        assert first_observation.wait(5)
+        for relay in relays:
+            relay.join(5)
+        assert all(not relay.is_alive() for relay in relays)
+        assert writes == {11: [request], 21: [response]}
+        assert queued_before_forward == {11: [True], 21: [True]}
+        assert failures == []
+    finally:
+        release.set()
+        for relay in relays:
+            relay.join(5)
+        worker.close()
+
+    events, metadata = observer.seal()
+    assert [event["type"] for event in events] == [
+        "command.started",
+        "tool.call.started",
+        "tool.call.finished",
+    ]
+    assert metadata["complete"] is True
+
+
+def test_observation_queue_overflow_is_nonblocking_and_recovers() -> None:
+    observer = mcp_proxy._Observer(
+        "omitted", "2026-08-06T00:00:00Z", ["server"], "."
+    )
+    original_observe = observer.observe
+    observing = mcp_proxy.threading.Event()
+    release = mcp_proxy.threading.Event()
+
+    def blocked_first(
+        direction: mcp_proxy.Direction, raw: bytes, **timing: object
+    ) -> None:
+        if not observing.is_set():
+            observing.set()
+            assert release.wait(5)
+        original_observe(direction, raw, **timing)  # type: ignore[arg-type]
+
+    observer.observe = blocked_first  # type: ignore[method-assign]
+    worker = mcp_proxy._ObservationWorker(observer, max_items=1, max_bytes=1024)
+    noop = b'{"jsonrpc":"2.0","id":0,"method":"ping"}\n'
+    dropped_request = message(2, "tools/call", {"name": "echo", "arguments": {}})
+    orphan_response = b'{"jsonrpc":"2.0","id":2,"result":{}}\n'
+    assert worker.observe("client", noop) is True
+    assert observing.wait(5)
+    assert worker.observe("client", dropped_request) is False
+    release.set()
+    with worker.condition:
+        assert worker.condition.wait_for(
+            lambda: worker.outstanding_items == 0, timeout=5
+        )
+    assert worker.observe("server", orphan_response) is True
+    worker.close()
+
+    events, metadata = observer.seal()
+    assert [event["type"] for event in events] == ["command.started"]
+    assert metadata["unobserved_messages"] == 1
+    assert metadata["reasons"] == ["observer_queue_overflow"]
+    assert not worker.thread.is_alive()
+
+
+def test_observation_queue_byte_limit_charges_active_work() -> None:
+    observer = mcp_proxy._Observer(
+        "omitted", "2026-08-06T00:00:00Z", ["server"], "."
+    )
+    original_observe = observer.observe
+    observing = mcp_proxy.threading.Event()
+    release = mcp_proxy.threading.Event()
+
+    def blocked_first(
+        direction: mcp_proxy.Direction, raw: bytes, **timing: object
+    ) -> None:
+        observing.set()
+        assert release.wait(5)
+        original_observe(direction, raw, **timing)  # type: ignore[arg-type]
+
+    observer.observe = blocked_first  # type: ignore[method-assign]
+    first = b'{"jsonrpc":"2.0","id":0,"method":"ping"}\n'
+    second = message(2, "tools/call", {"name": "echo", "arguments": {}})
+    worker = mcp_proxy._ObservationWorker(
+        observer,
+        max_items=10,
+        max_bytes=len(first) + len(second) - 1,
+    )
+    assert worker.observe("client", first) is True
+    assert observing.wait(5)
+    with worker.condition:
+        assert worker.outstanding_items == 1
+        assert worker.outstanding_bytes == len(first)
+    assert worker.observe("client", second) is False
+    release.set()
+    worker.close()
+
+    _events, metadata = observer.seal()
+    assert metadata["unobserved_messages"] == 1
+    assert metadata["reasons"] == ["observer_queue_overflow"]
+    assert worker.outstanding_items == 0
+    assert worker.outstanding_bytes == 0
+
+
+def test_observation_overflow_reporting_failure_keeps_count_and_cause() -> None:
+    observer = mcp_proxy._Observer(
+        "omitted", "2026-08-06T00:00:00Z", ["server"], "."
+    )
+    original_observe = observer.observe
+    original_mark_many = observer.mark_unobserved_many
+    observing = mcp_proxy.threading.Event()
+    release = mcp_proxy.threading.Event()
+    overflow_failed = False
+
+    def blocked_observe(
+        direction: mcp_proxy.Direction, raw: bytes, **timing: object
+    ) -> None:
+        observing.set()
+        assert release.wait(5)
+        original_observe(direction, raw, **timing)  # type: ignore[arg-type]
+
+    def fail_overflow_once(reason: str, count: int) -> None:
+        nonlocal overflow_failed
+        if reason == "observer_queue_overflow" and not overflow_failed:
+            overflow_failed = True
+            raise RuntimeError("injected overflow reporting failure")
+        original_mark_many(reason, count)
+
+    observer.observe = blocked_observe  # type: ignore[method-assign]
+    observer.mark_unobserved_many = fail_overflow_once  # type: ignore[method-assign]
+    worker = mcp_proxy._ObservationWorker(observer, max_items=1, max_bytes=1024)
+    noop = b'{"jsonrpc":"2.0","id":0,"method":"ping"}\n'
+    assert worker.observe("client", noop) is True
+    assert observing.wait(5)
+    assert worker.observe("client", noop) is False
+    assert worker.observe("client", noop) is False
+    release.set()
+    worker.close()
+
+    _events, metadata = observer.seal()
+    assert metadata["unobserved_messages"] == 2
+    assert metadata["reasons"] == ["observer_error", "observer_queue_overflow"]
+
+
+def test_observation_worker_contains_item_failure_and_continues() -> None:
+    observer = mcp_proxy._Observer(
+        "omitted", "2026-08-06T00:00:00Z", ["server"], "."
+    )
+    original_observe = observer.observe
+    calls = 0
+
+    def fail_once(
+        direction: mcp_proxy.Direction, raw: bytes, **timing: object
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("injected observer failure")
+        original_observe(direction, raw, **timing)  # type: ignore[arg-type]
+
+    observer.observe = fail_once  # type: ignore[method-assign]
+    worker = mcp_proxy._ObservationWorker(observer)
+    worker.observe("client", b'{"jsonrpc":"2.0","id":0,"method":"ping"}\n')
+    worker.observe(
+        "client", message(3, "tools/call", {"name": "echo", "arguments": {}})
+    )
+    worker.close()
+
+    events, metadata = observer.seal()
+    assert [event["type"] for event in events] == [
+        "command.started",
+        "tool.call.started",
+    ]
+    assert metadata["unobserved_messages"] == 1
+    assert metadata["reasons"] == ["observer_error"]
+
+
+def test_observation_worker_preserves_relay_timestamps_under_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer = mcp_proxy._Observer(
+        "omitted", "2026-08-06T00:00:00Z", ["server"], "."
+    )
+    monotonic_values = iter([10.0, 10.25])
+    wall_values = iter(["2026-08-06T00:00:01Z", "2026-08-06T00:00:02Z"])
+    monotonic_calls: list[float] = []
+    wall_calls: list[str] = []
+
+    def fake_monotonic() -> float:
+        value = next(monotonic_values, 10.25)
+        monotonic_calls.append(value)
+        return value
+
+    def fake_utc_now() -> str:
+        value = next(wall_values, "2026-08-06T00:00:02Z")
+        wall_calls.append(value)
+        return value
+
+    monkeypatch.setattr(mcp_proxy.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(mcp_proxy, "utc_now", fake_utc_now)
+    worker = mcp_proxy._ObservationWorker(observer)
+    worker.observe(
+        "client", message(8, "tools/call", {"name": "echo", "arguments": {}})
+    )
+    worker.observe("server", b'{"jsonrpc":"2.0","id":8,"result":{}}\n')
+    worker.close()
+
+    events, _metadata = observer.seal()
+    assert events[1]["at"] == "2026-08-06T00:00:01Z"
+    assert events[2]["at"] == "2026-08-06T00:00:02Z"
+    assert events[2]["data"]["duration_ms"] == 250
+    assert monotonic_calls == [10.0, 10.25]
+    assert wall_calls == ["2026-08-06T00:00:01Z", "2026-08-06T00:00:02Z"]
+
+
+def test_observation_worker_fatal_failure_accounts_for_queued_and_late_work() -> None:
+    observer = mcp_proxy._Observer(
+        "omitted", "2026-08-06T00:00:00Z", ["server"], "."
+    )
+    observing = mcp_proxy.threading.Event()
+    release = mcp_proxy.threading.Event()
+
+    def fail_fatally(
+        _direction: mcp_proxy.Direction, _raw: bytes, **_timing: object
+    ) -> None:
+        observing.set()
+        assert release.wait(5)
+        raise KeyboardInterrupt
+
+    observer.observe = fail_fatally  # type: ignore[method-assign]
+    worker = mcp_proxy._ObservationWorker(observer)
+    first = b'{"jsonrpc":"2.0","id":0,"method":"ping"}\n'
+    second = b'{"jsonrpc":"2.0","id":1,"method":"ping"}\n'
+    assert worker.observe("client", first) is True
+    assert observing.wait(5)
+    assert worker.observe("client", second) is True
+    release.set()
+    with worker.condition:
+        assert worker.condition.wait_for(lambda: worker.failed, timeout=5)
+    worker.mark_incomplete("client_relay_unfinished")
+    assert worker.observe("client", second) is False
+    worker.close()
+
+    events, metadata = observer.seal()
+    assert [event["type"] for event in events] == ["command.started"]
+    assert metadata["unobserved_messages"] == 3
+    assert metadata["reasons"] == [
+        "client_relay_unfinished",
+        "observer_worker_failed",
+    ]
+    assert worker.outstanding_items == 0
+    assert worker.outstanding_bytes == 0
+    assert not worker.queue
+    assert not worker.thread.is_alive()
+    assert worker.observe("client", second) is False
+    assert observer.snapshot_observation() == metadata
+
+
+def test_observation_worker_counts_submissions_during_close() -> None:
+    observer = mcp_proxy._Observer(
+        "omitted", "2026-08-06T00:00:00Z", ["server"], "."
+    )
+    original_observe = observer.observe
+    observing = mcp_proxy.threading.Event()
+    release = mcp_proxy.threading.Event()
+
+    def blocked_observe(
+        direction: mcp_proxy.Direction, raw: bytes, **timing: object
+    ) -> None:
+        observing.set()
+        assert release.wait(5)
+        original_observe(direction, raw, **timing)  # type: ignore[arg-type]
+
+    observer.observe = blocked_observe  # type: ignore[method-assign]
+    worker = mcp_proxy._ObservationWorker(observer)
+    noop = b'{"jsonrpc":"2.0","id":0,"method":"ping"}\n'
+    assert worker.observe("client", noop) is True
+    assert observing.wait(5)
+    closer = mcp_proxy.threading.Thread(target=worker.close)
+    closer.start()
+    with worker.condition:
+        assert worker.condition.wait_for(lambda: worker.closed, timeout=5)
+    assert worker.observe("client", noop) is False
+    release.set()
+    closer.join(5)
+
+    _events, metadata = observer.seal()
+    assert not closer.is_alive()
+    assert metadata["unobserved_messages"] == 1
+    assert metadata["reasons"] == ["observer_dropped_after_close"]
+
+
+def test_observation_worker_snapshots_input_and_accounts_late_work_until_seal() -> None:
+    observer = mcp_proxy._Observer(
+        "omitted", "2026-08-06T00:00:00Z", ["server"], "."
+    )
+    worker = mcp_proxy._ObservationWorker(observer)
+    raw = bytearray(message(4, "tools/call", {"name": "original", "arguments": {}}))
+    assert worker.observe("client", raw) is True  # type: ignore[arg-type]
+    raw[:] = b"x" * len(raw)
+    worker.close()
+    assert (
+        worker.observe(
+            "client", message(5, "tools/call", {"name": "late", "arguments": {}})
+        )
+        is False
+    )
+    events, before = observer.seal()
+
+    assert events[1]["data"]["name"] == "original"
+    assert before["unobserved_messages"] == 1
+    assert before["reasons"] == ["observer_dropped_after_close"]
+    assert (
+        worker.observe(
+            "client", message(6, "tools/call", {"name": "sealed", "arguments": {}})
+        )
+        is False
+    )
+    assert observer.snapshot_observation() == before
+
+
+def test_oversized_relay_marker_flows_through_observation_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_proxy, "OBSERVATION_BYTES", 4)
+    reads = iter([b"abcdef\n", b""])
+    writes: list[bytes] = []
+    monkeypatch.setattr(mcp_proxy, "_raw_read", lambda _fd: next(reads))
+    monkeypatch.setattr(
+        mcp_proxy,
+        "_raw_write",
+        lambda _fd, data, _lock: writes.append(bytes(data)),
+    )
+    observer = mcp_proxy._Observer(
+        "omitted", "2026-08-06T00:00:00Z", ["server"], "."
+    )
+    worker = mcp_proxy._ObservationWorker(observer)
+    mcp_proxy._relay_messages(
+        0,
+        1,
+        mcp_proxy.threading.Lock(),
+        worker,
+        "client",
+        mcp_proxy.threading.Event(),
+        [],
+        mcp_proxy.threading.Event(),
+    )
+    worker.close()
+
+    _events, metadata = observer.seal()
+    assert writes == [b"abcde", b"f\n"]
+    assert metadata["unobserved_messages"] == 1
+    assert metadata["reasons"] == ["oversized"]
 
 
 def test_overflow_write_failure_does_not_repeat_forwarded_prefix(
@@ -1427,6 +1925,25 @@ def test_standard_fd_failure_happens_before_store_creation(
     with pytest.raises(mcp_proxy.McpProxyError, match="mcp_stdio_unavailable"):
         mcp_proxy.proxy_mcp_stdio([sys.executable, "-c", "pass"], root=tmp_path / "store")
     assert not (tmp_path / "store").exists()
+
+
+def test_observation_worker_start_failure_publishes_fixed_failed_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_to_start(_observer: object) -> object:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(mcp_proxy, "_ObservationWorker", fail_to_start)
+    monkeypatch.setattr(mcp_proxy, "_write_diagnostic", lambda *_args: None)
+    result = mcp_proxy.proxy_mcp_stdio(
+        [sys.executable, "-c", "pass"], root=tmp_path / "store"
+    )
+
+    assert result.exit_code == 1
+    assert result.trace["status"] == "failed"
+    assert result.trace["mcp_proxy"]["shutdown_reason"] == "mcp_proxy_failed"
+    trace_paths = list((tmp_path / "store" / "runs").glob("*/trace.json"))
+    assert len(trace_paths) == 1
 
 
 def test_standard_fd_duplication_cleans_up_partial_state(

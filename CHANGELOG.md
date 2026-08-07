@@ -6,6 +6,13 @@ The format is based on Keep a Changelog, and this project will follow semantic v
 
 ## [Unreleased]
 
+## [0.1.2.0] - 2026-08-06
+
+- Moved bounded MCP parsing, redaction, and capture work off the protocol relay
+  path while preserving causal ordering, wire bytes, and relay-side timing.
+- Added explicit queue-saturation metadata and concurrency, accounting,
+  shutdown, and failure-containment regression coverage.
+
 ## [0.1.1.0] - 2026-08-05
 
 - Closed the Windows MCP server spawn-to-Job race by assigning and verifying
