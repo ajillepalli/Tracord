@@ -78,7 +78,9 @@ blocks or changes wire traffic; it produces
 count-only `observer_queue_overflow` metadata and a deliberately partial
 observation. Recoverable item failures use `observer_error`; a worker that
 cannot continue uses `observer_worker_failed` for all affected work. Messages
-submitted during observer shutdown use `observer_dropped_after_close`.
+and relay reason markers submitted during observer shutdown use
+`observer_dropped_after_close`; work arriving after the trace is sealed cannot
+be added to its counters.
 
 The proxy and command recorder share identity-checked run creation, exclusive
 artifact writes, and atomic `trace.json` publication. POSIX children run in a

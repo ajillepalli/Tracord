@@ -666,6 +666,8 @@ class _ObservationWorker:
                     )
             except Exception:
                 try:
+                    if kind == "overflow":
+                        self.observer.mark_incomplete("observer_queue_overflow")
                     self.observer.mark_unobserved_many("observer_error", count)
                 except BaseException:
                     self._fail(count)

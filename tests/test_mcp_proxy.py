@@ -521,7 +521,7 @@ def test_bidirectional_relay_preserves_causal_observation_order(
     release = mcp_proxy.threading.Event()
     read_counts = {10: 0, 20: 0}
     writes: dict[int, list[bytes]] = {11: [], 21: []}
-    queued_before_forward: list[bool] = []
+    queued_before_forward: dict[int, list[bool]] = {11: [], 21: []}
 
     def read(fd: int) -> bytes:
         read_counts[fd] += 1
@@ -534,9 +534,13 @@ def test_bidirectional_relay_preserves_causal_observation_order(
 
     def write(fd: int, data: bytes, _lock: object) -> None:
         writes[fd].append(bytes(data))
-        if fd == 11:
+        if fd in queued_before_forward:
             with worker.condition:
-                queued_before_forward.append(worker.outstanding_items >= 1)
+                expected_items = 1 if fd == 11 else 2
+                queued_before_forward[fd].append(
+                    worker.outstanding_items >= expected_items
+                )
+        if fd == 11:
             request_forwarded.set()
 
     observer = mcp_proxy._Observer(
@@ -595,7 +599,7 @@ def test_bidirectional_relay_preserves_causal_observation_order(
             relay.join(5)
         assert all(not relay.is_alive() for relay in relays)
         assert writes == {11: [request], 21: [response]}
-        assert queued_before_forward == [True]
+        assert queued_before_forward == {11: [True], 21: [True]}
         assert failures == []
     finally:
         release.set()
@@ -690,6 +694,46 @@ def test_observation_queue_byte_limit_charges_active_work() -> None:
     assert worker.outstanding_bytes == 0
 
 
+def test_observation_overflow_reporting_failure_keeps_count_and_cause() -> None:
+    observer = mcp_proxy._Observer(
+        "omitted", "2026-08-06T00:00:00Z", ["server"], "."
+    )
+    original_observe = observer.observe
+    original_mark_many = observer.mark_unobserved_many
+    observing = mcp_proxy.threading.Event()
+    release = mcp_proxy.threading.Event()
+    overflow_failed = False
+
+    def blocked_observe(
+        direction: mcp_proxy.Direction, raw: bytes, **timing: object
+    ) -> None:
+        observing.set()
+        assert release.wait(5)
+        original_observe(direction, raw, **timing)  # type: ignore[arg-type]
+
+    def fail_overflow_once(reason: str, count: int) -> None:
+        nonlocal overflow_failed
+        if reason == "observer_queue_overflow" and not overflow_failed:
+            overflow_failed = True
+            raise RuntimeError("injected overflow reporting failure")
+        original_mark_many(reason, count)
+
+    observer.observe = blocked_observe  # type: ignore[method-assign]
+    observer.mark_unobserved_many = fail_overflow_once  # type: ignore[method-assign]
+    worker = mcp_proxy._ObservationWorker(observer, max_items=1, max_bytes=1024)
+    noop = b'{"jsonrpc":"2.0","id":0,"method":"ping"}\n'
+    assert worker.observe("client", noop) is True
+    assert observing.wait(5)
+    assert worker.observe("client", noop) is False
+    assert worker.observe("client", noop) is False
+    release.set()
+    worker.close()
+
+    _events, metadata = observer.seal()
+    assert metadata["unobserved_messages"] == 2
+    assert metadata["reasons"] == ["observer_error", "observer_queue_overflow"]
+
+
 def test_observation_worker_contains_item_failure_and_continues() -> None:
     observer = mcp_proxy._Observer(
         "omitted", "2026-08-06T00:00:00Z", ["server"], "."
@@ -731,12 +775,21 @@ def test_observation_worker_preserves_relay_timestamps_under_backlog(
     )
     monotonic_values = iter([10.0, 10.25])
     wall_values = iter(["2026-08-06T00:00:01Z", "2026-08-06T00:00:02Z"])
-    monkeypatch.setattr(
-        mcp_proxy.time, "monotonic", lambda: next(monotonic_values, 10.25)
-    )
-    monkeypatch.setattr(
-        mcp_proxy, "utc_now", lambda: next(wall_values, "2026-08-06T00:00:02Z")
-    )
+    monotonic_calls: list[float] = []
+    wall_calls: list[str] = []
+
+    def fake_monotonic() -> float:
+        value = next(monotonic_values, 10.25)
+        monotonic_calls.append(value)
+        return value
+
+    def fake_utc_now() -> str:
+        value = next(wall_values, "2026-08-06T00:00:02Z")
+        wall_calls.append(value)
+        return value
+
+    monkeypatch.setattr(mcp_proxy.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(mcp_proxy, "utc_now", fake_utc_now)
     worker = mcp_proxy._ObservationWorker(observer)
     worker.observe(
         "client", message(8, "tools/call", {"name": "echo", "arguments": {}})
@@ -748,6 +801,8 @@ def test_observation_worker_preserves_relay_timestamps_under_backlog(
     assert events[1]["at"] == "2026-08-06T00:00:01Z"
     assert events[2]["at"] == "2026-08-06T00:00:02Z"
     assert events[2]["data"]["duration_ms"] == 250
+    assert monotonic_calls == [10.0, 10.25]
+    assert wall_calls == ["2026-08-06T00:00:01Z", "2026-08-06T00:00:02Z"]
 
 
 def test_observation_worker_fatal_failure_accounts_for_queued_and_late_work() -> None:
@@ -774,13 +829,17 @@ def test_observation_worker_fatal_failure_accounts_for_queued_and_late_work() ->
     release.set()
     with worker.condition:
         assert worker.condition.wait_for(lambda: worker.failed, timeout=5)
+    worker.mark_incomplete("client_relay_unfinished")
     assert worker.observe("client", second) is False
     worker.close()
 
     events, metadata = observer.seal()
     assert [event["type"] for event in events] == ["command.started"]
     assert metadata["unobserved_messages"] == 3
-    assert metadata["reasons"] == ["observer_worker_failed"]
+    assert metadata["reasons"] == [
+        "client_relay_unfinished",
+        "observer_worker_failed",
+    ]
     assert worker.outstanding_items == 0
     assert worker.outstanding_bytes == 0
     assert not worker.queue
@@ -823,7 +882,7 @@ def test_observation_worker_counts_submissions_during_close() -> None:
     assert metadata["reasons"] == ["observer_dropped_after_close"]
 
 
-def test_observation_worker_snapshots_mutable_input_and_ignores_late_work() -> None:
+def test_observation_worker_snapshots_input_and_accounts_late_work_until_seal() -> None:
     observer = mcp_proxy._Observer(
         "omitted", "2026-08-06T00:00:00Z", ["server"], "."
     )
@@ -832,12 +891,20 @@ def test_observation_worker_snapshots_mutable_input_and_ignores_late_work() -> N
     assert worker.observe("client", raw) is True  # type: ignore[arg-type]
     raw[:] = b"x" * len(raw)
     worker.close()
-    events, before = observer.seal()
-
-    assert events[1]["data"]["name"] == "original"
     assert (
         worker.observe(
             "client", message(5, "tools/call", {"name": "late", "arguments": {}})
+        )
+        is False
+    )
+    events, before = observer.seal()
+
+    assert events[1]["data"]["name"] == "original"
+    assert before["unobserved_messages"] == 1
+    assert before["reasons"] == ["observer_dropped_after_close"]
+    assert (
+        worker.observe(
+            "client", message(6, "tools/call", {"name": "sealed", "arguments": {}})
         )
         is False
     )

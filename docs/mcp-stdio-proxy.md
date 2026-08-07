@@ -61,11 +61,12 @@ affected messages are not captured and observation reports the count-only
 `observer_queue_overflow` reason. A recoverable item failure reports
 `observer_error` and the worker continues; a worker that cannot continue reports
 `observer_worker_failed` for all affected messages. Wire forwarding continues in
-both cases. A relay message that arrives while observation is closing reports
-`observer_dropped_after_close`. Queue availability depends on observer
-scheduling; the memory bound and incomplete-count reporting are deterministic,
-while capture completeness under sustained saturation is best effort. OS reads
-and writes remain subject to normal transport latency.
+both cases. A relay message or reason marker that arrives while observation is
+closing reports `observer_dropped_after_close`; work that arrives after the
+trace is sealed cannot be added to its counters. Queue availability depends on
+observer scheduling; the memory bound and pre-seal incomplete-count reporting
+are deterministic, while capture completeness under sustained saturation is
+best effort. OS reads and writes remain subject to normal transport latency.
 
 Observation retains at most 4,096 in-flight calls and 10,000 event slots.
 Captured values are limited to 1 MiB each and 8 MiB in aggregate. Tracord may
