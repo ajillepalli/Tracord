@@ -69,6 +69,13 @@ Malformed, unsupported, or messages larger than 1 MiB continue over the wire
 and make observation explicitly incomplete. In-flight calls, events, captures,
 stored argv, and the final trace all have independent bounds.
 
+Both protocol relays enqueue immutable observation snapshots before forwarding
+them. One bounded FIFO worker performs parsing, redaction, and capture, keeping
+that work off the relay hot path while preserving causal request-before-response
+order. The queue charges active work against its 64-message and 2 MiB limits.
+Saturation never blocks or changes wire traffic; it produces count-only
+`observer_queue_overflow` metadata and a deliberately partial observation.
+
 The proxy and command recorder share identity-checked run creation, exclusive
 artifact writes, and atomic `trace.json` publication. POSIX children run in a
 new process group. Windows children are created suspended, assigned to a

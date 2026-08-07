@@ -186,13 +186,18 @@ Traces produced by `mcp-proxy` add an `mcp_proxy` object. It declares the
 `stdio` transport, selected tool-data policy, relayed-but-not-recorded stream
 policy, raw child exit code, whether cleanup was proxy initiated, shutdown
 reason, argv normalization counts, and observation/capture summaries.
+`observation_limit_bytes`, `observation_queue_limit_bytes`, and
+`observation_queue_limit_messages` declare the per-message and bounded
+background-observation limits used for the run.
 
 The observation summary contains `complete`, count-only unobserved, unmatched,
 and dropped totals, plus stable reason labels. `complete: false` means the tool
 lifecycle is partial; it does not mean the relayed protocol failed. Messages
 that are malformed, unsupported, or larger than the 1 MiB observation buffer
-remain on the wire unchanged. `capture_omitted` reports policy, budget, unsafe
-value, and final-size omissions without retaining the omitted values.
+remain on the wire unchanged. Queue saturation also leaves wire traffic
+unchanged and adds the count-only `observer_queue_overflow` reason.
+`capture_omitted` reports policy, budget, unsafe value, and final-size omissions
+without retaining the omitted values.
 
 MCP proxy command events declare `adapter: "mcp-stdio"`. Their stdout and
 stderr artifacts are empty by policy because stdout is a protocol channel and

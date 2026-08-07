@@ -13,6 +13,7 @@ import stat
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal
@@ -31,6 +32,8 @@ from .storage import (
 
 
 OBSERVATION_BYTES = 1024 * 1024
+MAX_OBSERVATION_QUEUE_BYTES = 2 * (OBSERVATION_BYTES + 1)
+MAX_OBSERVATION_QUEUE_ITEMS = 64
 MAX_CAPTURE_VALUE_BYTES = 1024 * 1024
 MAX_CAPTURE_TOTAL_BYTES = 8 * 1024 * 1024
 MAX_STORED_COMMAND_BYTES = 64 * 1024
@@ -240,10 +243,16 @@ class _Observer:
         self.reasons: set[str] = set()
 
     def mark_unobserved(self, reason: str) -> None:
+        self.mark_unobserved_many(reason, 1)
+
+    def mark_unobserved_many(self, reason: str, count: int) -> None:
+        if count <= 0:
+            return
         with self.lock:
             if self.sealed:
                 return
-            self._mark_unobserved_locked(reason)
+            self.unobserved_messages += count
+            self.reasons.add(reason)
 
     def mark_incomplete(self, reason: str) -> None:
         with self.lock:
@@ -254,7 +263,17 @@ class _Observer:
         self.unobserved_messages += 1
         self.reasons.add(reason)
 
-    def observe(self, direction: Direction, raw: bytes) -> None:
+    def observe(
+        self,
+        direction: Direction,
+        raw: bytes,
+        *,
+        observed_at: str | None = None,
+        observed_monotonic: float | None = None,
+    ) -> None:
+        observed_at = observed_at or utc_now()
+        if observed_monotonic is None:
+            observed_monotonic = time.monotonic()
         try:
             parse_raw = raw[:-1] if raw.endswith(b"\n") else raw
             if parse_raw.endswith(b"\r"):
@@ -277,20 +296,24 @@ class _Observer:
             self.mark_unobserved("unsupported_envelope")
             return
         if direction == "client":
-            self._observe_client(message)
+            self._observe_client(message, observed_at, observed_monotonic)
         else:
-            self._observe_server(message)
+            self._observe_server(message, observed_at, observed_monotonic)
 
-    def _observe_client(self, message: dict[str, object]) -> None:
+    def _observe_client(
+        self, message: dict[str, object], observed_at: str, observed_monotonic: float
+    ) -> None:
         method = message.get("method")
         if method == "tools/call":
-            self._start_tool_call(message)
+            self._start_tool_call(message, observed_at, observed_monotonic)
         elif method == "notifications/cancelled":
             params = message.get("params")
             if isinstance(params, dict):
-                self._cancel_tool_call(params.get("requestId"))
+                self._cancel_tool_call(params.get("requestId"), observed_at, observed_monotonic)
 
-    def _start_tool_call(self, message: dict[str, object]) -> None:
+    def _start_tool_call(
+        self, message: dict[str, object], observed_at: str, observed_monotonic: float
+    ) -> None:
         key = _request_key(message.get("id"))
         params = message.get("params")
         if key is None or not isinstance(params, dict):
@@ -327,14 +350,16 @@ class _Observer:
             self.events.append(
                 {
                     "type": "tool.call.started",
-                    "at": utc_now(),
+                    "at": observed_at,
                     "data": {"call_id": call_id, "name": name, "input": capture},
                 }
             )
             self.reserved_finishes += 1
-            self.in_flight[inflight_key] = _InFlight(call_id, time.monotonic())
+            self.in_flight[inflight_key] = _InFlight(call_id, observed_monotonic)
 
-    def _cancel_tool_call(self, request_id: object) -> None:
+    def _cancel_tool_call(
+        self, request_id: object, observed_at: str, observed_monotonic: float
+    ) -> None:
         key = _request_key(request_id)
         if key is None:
             return
@@ -346,9 +371,13 @@ class _Observer:
                 return
             if len(self.ignored_response_keys) < MAX_IN_FLIGHT:
                 self.ignored_response_keys.add(("client", key[0], key[1]))
-            self._finish_locked(entry, "cancelled", None, None)
+            self._finish_locked(
+                entry, "cancelled", None, None, observed_at, observed_monotonic
+            )
 
-    def _observe_server(self, message: dict[str, object]) -> None:
+    def _observe_server(
+        self, message: dict[str, object], observed_at: str, observed_monotonic: float
+    ) -> None:
         if "method" in message or ("result" in message) == ("error" in message):
             return
         key = _request_key(message.get("id"))
@@ -367,16 +396,33 @@ class _Observer:
                 return
             if "error" in message:
                 self._finish_locked(
-                    entry, "failed", message.get("error"), "Mcp.ProtocolError"
+                    entry,
+                    "failed",
+                    message.get("error"),
+                    "Mcp.ProtocolError",
+                    observed_at,
+                    observed_monotonic,
                 )
                 return
             result = message.get("result")
             if isinstance(result, dict) and result.get("isError") is True:
                 self._finish_locked(
-                    entry, "failed", result, "Mcp.ToolExecutionError"
+                    entry,
+                    "failed",
+                    result,
+                    "Mcp.ToolExecutionError",
+                    observed_at,
+                    observed_monotonic,
                 )
             else:
-                self._finish_locked(entry, "succeeded", result, None)
+                self._finish_locked(
+                    entry,
+                    "succeeded",
+                    result,
+                    None,
+                    observed_at,
+                    observed_monotonic,
+                )
 
     def _finish_locked(
         self,
@@ -384,16 +430,20 @@ class _Observer:
         outcome: str,
         output: object,
         error_type: str | None,
+        observed_at: str,
+        observed_monotonic: float,
     ) -> None:
         data: dict[str, object] = {
             "call_id": entry.call_id,
             "outcome": outcome,
-            "duration_ms": max(0, int((time.monotonic() - entry.started) * 1000)),
+            "duration_ms": max(0, int((observed_monotonic - entry.started) * 1000)),
             "output": self._capture_locked(output, input_value=False),
         }
         if error_type is not None:
             data["error_type"] = error_type
-        self.events.append({"type": "tool.call.finished", "at": utc_now(), "data": data})
+        self.events.append(
+            {"type": "tool.call.finished", "at": observed_at, "data": data}
+        )
         self.reserved_finishes -= 1
 
     def _capture_locked(self, value: object, *, input_value: bool) -> dict[str, object]:
@@ -462,6 +512,180 @@ class _Observer:
         with self.lock:
             self.events_dropped += count
             self.reasons.add("events_dropped")
+
+
+class _ObservationWorker:
+    """Serialize bounded observation work away from the protocol relay threads.
+
+    Production relays submit immutable ``bytes`` values. Mutable bytes-like values are
+    snapshotted defensively for direct callers. Accepted work, including the item being
+    processed, remains charged to the queue limits until observation finishes.
+    """
+
+    def __init__(
+        self,
+        observer: _Observer,
+        *,
+        max_items: int = MAX_OBSERVATION_QUEUE_ITEMS,
+        max_bytes: int = MAX_OBSERVATION_QUEUE_BYTES,
+    ) -> None:
+        if max_items < 1 or max_bytes < 1:
+            raise ValueError("observation queue limits must be positive")
+        self.observer = observer
+        self.max_items = max_items
+        self.max_bytes = max_bytes
+        self.condition = threading.Condition()
+        self.queue: deque[
+            tuple[str, Direction | None, bytes | str, str | None, float | None]
+        ] = deque()
+        self.outstanding_items = 0
+        self.outstanding_bytes = 0
+        self.overflow = 0
+        self.fatal_dropped = 0
+        self.incomplete_reasons: set[str] = set()
+        self.closed = False
+        self.failed = False
+        self.finalized = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def observe(self, direction: Direction, raw: bytes) -> bool:
+        payload = raw if isinstance(raw, bytes) else bytes(raw)
+        observed_monotonic = time.monotonic()
+        observed_at = utc_now()
+        with self.condition:
+            if self.finalized:
+                return False
+            if self.failed:
+                self.fatal_dropped += 1
+                return False
+            if self.closed:
+                return False
+            if (
+                self.outstanding_items >= self.max_items
+                or self.outstanding_bytes + len(payload) > self.max_bytes
+            ):
+                self.overflow += 1
+                self.condition.notify()
+                return False
+            self.queue.append(
+                ("message", direction, payload, observed_at, observed_monotonic)
+            )
+            self.outstanding_items += 1
+            self.outstanding_bytes += len(payload)
+            self.condition.notify()
+            return True
+
+    def mark_unobserved(self, reason: str) -> bool:
+        with self.condition:
+            if self.finalized:
+                return False
+            if self.failed:
+                self.fatal_dropped += 1
+                return False
+            if self.closed:
+                return False
+            if self.outstanding_items >= self.max_items:
+                self.overflow += 1
+                self.condition.notify()
+                return False
+            self.queue.append(("marker", None, reason, None, None))
+            self.outstanding_items += 1
+            self.condition.notify()
+            return True
+
+    def mark_incomplete(self, reason: str) -> None:
+        with self.condition:
+            if not self.finalized:
+                self.incomplete_reasons.add(reason)
+
+    def close(self) -> None:
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+        self.thread.join()
+        with self.condition:
+            if self.finalized:
+                return
+            self.finalized = True
+            overflow = self.overflow
+            fatal_dropped = self.fatal_dropped
+            incomplete_reasons = sorted(self.incomplete_reasons)
+            self.overflow = 0
+            self.fatal_dropped = 0
+        self.observer.mark_unobserved_many("observer_queue_overflow", overflow)
+        self.observer.mark_unobserved_many("observer_worker_failed", fatal_dropped)
+        for reason in incomplete_reasons:
+            self.observer.mark_incomplete(reason)
+
+    def _run(self) -> None:
+        while True:
+            with self.condition:
+                while not self.queue and not self.overflow and not self.closed:
+                    self.condition.wait()
+                if self.queue:
+                    kind, direction, value, observed_at, observed_monotonic = (
+                        self.queue.popleft()
+                    )
+                    item_bytes = len(value) if kind == "message" else 0
+                    count = 1
+                elif self.overflow:
+                    kind, direction, value = "overflow", None, ""
+                    observed_at, observed_monotonic = None, None
+                    item_bytes = 0
+                    count = self.overflow
+                    self.overflow = 0
+                else:
+                    return
+            try:
+                if kind == "message":
+                    assert direction is not None and isinstance(value, bytes)
+                    assert observed_at is not None and observed_monotonic is not None
+                    self.observer.observe(
+                        direction,
+                        value,
+                        observed_at=observed_at,
+                        observed_monotonic=observed_monotonic,
+                    )
+                elif kind == "marker":
+                    assert isinstance(value, str)
+                    self.observer.mark_unobserved(value)
+                else:
+                    self.observer.mark_unobserved_many(
+                        "observer_queue_overflow", count
+                    )
+            except Exception:
+                try:
+                    self.observer.mark_unobserved("observer_error")
+                except BaseException:
+                    self._fail(count)
+                    return
+            except BaseException:
+                self._fail(count)
+                return
+            finally:
+                if kind in {"message", "marker"}:
+                    with self.condition:
+                        self.outstanding_items -= 1
+                        self.outstanding_bytes -= item_bytes
+                        self.condition.notify_all()
+
+    def _fail(self, current_count: int) -> None:
+        with self.condition:
+            queued_bytes = sum(
+                len(value)
+                for kind, _direction, value, _observed_at, _observed_monotonic in self.queue
+                if kind == "message"
+            )
+            queued_count = len(self.queue)
+            self.queue.clear()
+            self.outstanding_items -= queued_count
+            self.outstanding_bytes -= queued_bytes
+            self.fatal_dropped += current_count + queued_count + self.overflow
+            self.overflow = 0
+            self.failed = True
+            self.closed = True
+            self.condition.notify_all()
 
 
 def _sanitize_command(command: list[str]) -> tuple[list[str], bool, int]:
@@ -663,7 +887,7 @@ def _relay_messages(
     source_fd: int,
     target_fd: int,
     target_lock: threading.Lock,
-    observer: _Observer,
+    observer: _Observer | _ObservationWorker,
     direction: Direction,
     done: threading.Event,
     failure: list[str],
@@ -1294,6 +1518,7 @@ def proxy_mcp_stdio(
     started_at = utc_now()
     started = time.monotonic()
     observer = _Observer(tool_data, started_at, stored_command, cwd)
+    observation_worker: _ObservationWorker | None = None
     stdout_lock = threading.Lock()
     stderr_lock = threading.Lock()
     shutdown = threading.Event()
@@ -1326,6 +1551,7 @@ def proxy_mcp_stdio(
             signal.signal(signum, request_signal)
 
     try:
+        observation_worker = _ObservationWorker(observer)
         try:
             process, job, process_group = _launch_process(resolved)
         except OSError:
@@ -1352,7 +1578,7 @@ def proxy_mcp_stdio(
                     0,
                     child_stdin.fd,
                     child_stdin.lock,
-                    observer,
+                    observation_worker,
                     "client",
                     client_done,
                     failures,
@@ -1367,7 +1593,7 @@ def proxy_mcp_stdio(
                     process.stdout.fileno(),
                     stdout_fd,
                     stdout_lock,
-                    observer,
+                    observation_worker,
                     "server",
                     stdout_done,
                     failures,
@@ -1411,7 +1637,7 @@ def proxy_mcp_stdio(
                 if time.monotonic() >= eof_deadline:
                     proxy_cleanup = True
                     shutdown_reason = "client_eof_grace_expired"
-                    observer.mark_incomplete("client_disconnected")
+                    observation_worker.mark_incomplete("client_disconnected")
                     break
             shutdown.wait(POLL_SECONDS)
 
@@ -1421,7 +1647,7 @@ def proxy_mcp_stdio(
         if not close_child_stdin(PROCESS_TERM_GRACE_SECONDS):
             proxy_cleanup = True
             shutdown_reason = "client_stdin_close_grace_expired"
-            observer.mark_incomplete("client_relay_blocked")
+            observation_worker.mark_incomplete("client_relay_blocked")
             shutdown.set()
             if not tree_terminated:
                 _terminate_tree(process, job, process_group)
@@ -1433,7 +1659,7 @@ def proxy_mcp_stdio(
         if not stdout_done.is_set() or not stderr_done.is_set():
             proxy_cleanup = True
             shutdown_reason = "descendant_grace_expired"
-            observer.mark_incomplete("descendant_cleanup")
+            observation_worker.mark_incomplete("descendant_cleanup")
             if not tree_terminated:
                 _terminate_tree(process, job, process_group)
                 tree_terminated = True
@@ -1461,6 +1687,8 @@ def proxy_mcp_stdio(
 
     finished_at = utc_now()
     duration_ms = max(0, int((time.monotonic() - started) * 1000))
+    if observation_worker is not None:
+        observation_worker.close()
     if not client_done.is_set():
         observer.mark_incomplete("client_relay_unfinished")
     if process is not None and not stdout_done.is_set():
@@ -1494,6 +1722,8 @@ def proxy_mcp_stdio(
         "streams": {"stdout": "relayed", "stderr": "relayed"},
         "observation": observation,
         "observation_limit_bytes": OBSERVATION_BYTES,
+        "observation_queue_limit_bytes": MAX_OBSERVATION_QUEUE_BYTES,
+        "observation_queue_limit_messages": MAX_OBSERVATION_QUEUE_ITEMS,
         "capture_omitted": observer.capture_omitted,
         "raw_child_exit_code": raw_child_code,
         "proxy_initiated_cleanup": proxy_cleanup,
@@ -1576,9 +1806,9 @@ def proxy_mcp_stdio(
         _write_diagnostic(stderr_fd, stderr_lock, stderr_last, failures[0], stderr_done.is_set())
     for signum, handler in old_handlers.items():
         signal.signal(signum, handler)
-    if stdout_done.is_set():
+    if stdout_done.is_set() or process is None:
         os.close(stdout_fd)
-    if stderr_done.is_set():
+    if stderr_done.is_set() or process is None:
         os.close(stderr_fd)
     if job is not None:
         job.close()
