@@ -197,7 +197,9 @@ that are malformed, unsupported, or larger than the 1 MiB observation buffer
 remain on the wire unchanged. Queue saturation also leaves wire traffic
 unchanged and adds the count-only `observer_queue_overflow` reason. A contained
 per-item observation fault adds `observer_error`; an observation worker that
-cannot continue adds `observer_worker_failed` for every affected message.
+cannot continue adds `observer_worker_failed` for every affected message. A
+relay message submitted during observer shutdown adds
+`observer_dropped_after_close`.
 `capture_omitted` reports policy, budget, unsafe value, and final-size omissions
 without retaining the omitted values.
 

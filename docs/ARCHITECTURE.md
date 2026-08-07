@@ -77,7 +77,8 @@ order. The queue charges active work against its 64-message limit and exact
 blocks or changes wire traffic; it produces
 count-only `observer_queue_overflow` metadata and a deliberately partial
 observation. Recoverable item failures use `observer_error`; a worker that
-cannot continue uses `observer_worker_failed` for all affected work.
+cannot continue uses `observer_worker_failed` for all affected work. Messages
+submitted during observer shutdown use `observer_dropped_after_close`.
 
 The proxy and command recorder share identity-checked run creation, exclusive
 artifact writes, and atomic `trace.json` publication. POSIX children run in a

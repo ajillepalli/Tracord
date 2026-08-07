@@ -542,6 +542,7 @@ class _ObservationWorker:
         self.outstanding_bytes = 0
         self.overflow = 0
         self.fatal_dropped = 0
+        self.closed_dropped = 0
         self.incomplete_reasons: set[str] = set()
         self.closed = False
         self.failed = False
@@ -555,11 +556,13 @@ class _ObservationWorker:
         observed_at = utc_now()
         with self.condition:
             if self.finalized:
+                self.observer.mark_unobserved("observer_dropped_after_close")
                 return False
             if self.failed:
                 self.fatal_dropped += 1
                 return False
             if self.closed:
+                self.closed_dropped += 1
                 return False
             if (
                 self.outstanding_items >= self.max_items
@@ -579,11 +582,13 @@ class _ObservationWorker:
     def mark_unobserved(self, reason: str) -> bool:
         with self.condition:
             if self.finalized:
+                self.observer.mark_unobserved("observer_dropped_after_close")
                 return False
             if self.failed:
                 self.fatal_dropped += 1
                 return False
             if self.closed:
+                self.closed_dropped += 1
                 return False
             if self.outstanding_items >= self.max_items:
                 self.overflow += 1
@@ -610,11 +615,16 @@ class _ObservationWorker:
             self.finalized = True
             overflow = self.overflow
             fatal_dropped = self.fatal_dropped
+            closed_dropped = self.closed_dropped
             incomplete_reasons = sorted(self.incomplete_reasons)
             self.overflow = 0
             self.fatal_dropped = 0
+            self.closed_dropped = 0
         self.observer.mark_unobserved_many("observer_queue_overflow", overflow)
         self.observer.mark_unobserved_many("observer_worker_failed", fatal_dropped)
+        self.observer.mark_unobserved_many(
+            "observer_dropped_after_close", closed_dropped
+        )
         for reason in incomplete_reasons:
             self.observer.mark_incomplete(reason)
 
@@ -656,7 +666,7 @@ class _ObservationWorker:
                     )
             except Exception:
                 try:
-                    self.observer.mark_unobserved("observer_error")
+                    self.observer.mark_unobserved_many("observer_error", count)
                 except BaseException:
                     self._fail(count)
                     return
@@ -681,8 +691,7 @@ class _ObservationWorker:
             self.queue.clear()
             self.outstanding_items -= queued_count
             self.outstanding_bytes -= queued_bytes
-            self.fatal_dropped += current_count + queued_count + self.overflow
-            self.overflow = 0
+            self.fatal_dropped += current_count + queued_count
             self.failed = True
             self.closed = True
             self.condition.notify_all()
@@ -1687,12 +1696,18 @@ def proxy_mcp_stdio(
 
     finished_at = utc_now()
     duration_ms = max(0, int((time.monotonic() - started) * 1000))
+    if not client_done.is_set():
+        if observation_worker is not None:
+            observation_worker.mark_incomplete("client_relay_unfinished")
+        else:
+            observer.mark_incomplete("client_relay_unfinished")
+    if process is not None and not stdout_done.is_set():
+        if observation_worker is not None:
+            observation_worker.mark_incomplete("server_relay_unfinished")
+        else:
+            observer.mark_incomplete("server_relay_unfinished")
     if observation_worker is not None:
         observation_worker.close()
-    if not client_done.is_set():
-        observer.mark_incomplete("client_relay_unfinished")
-    if process is not None and not stdout_done.is_set():
-        observer.mark_incomplete("server_relay_unfinished")
     events, observation = observer.seal()
     incomplete_inflight = bool(observer.in_flight) and bool(observation["complete"])
     exit_code = _proxy_exit_code(
