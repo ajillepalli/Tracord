@@ -53,14 +53,18 @@ count-only reasons.
 
 JSON parsing, redaction, and capture run on one background observer so they do
 not hold up protocol forwarding. The observer queue is FIFO and bounded to 64
-messages and 2 MiB, including the message currently being processed. This
-preserves causal request-before-response ordering without making an unbounded
-copy of protocol traffic. If the queue is saturated, exact wire bytes still
-forward, but the affected messages are not captured and observation reports the
-count-only `observer_queue_overflow` reason. Queue availability depends on
-observer scheduling; the memory bound and incomplete-count reporting are
-deterministic, while capture completeness under sustained saturation is best
-effort. OS reads and writes remain subject to normal transport latency.
+messages and 2,097,154 bytes (two 1 MiB-plus-one observation buffers), including
+the message currently being processed. This preserves causal
+request-before-response ordering without making an unbounded copy of protocol
+traffic. If the queue is saturated, exact wire bytes still forward, but the
+affected messages are not captured and observation reports the count-only
+`observer_queue_overflow` reason. A recoverable item failure reports
+`observer_error` and the worker continues; a worker that cannot continue reports
+`observer_worker_failed` for all affected messages. Wire forwarding continues in
+both cases. Queue availability depends on observer scheduling; the memory bound
+and incomplete-count reporting are deterministic, while capture completeness
+under sustained saturation is best effort. OS reads and writes remain subject
+to normal transport latency.
 
 Observation retains at most 4,096 in-flight calls and 10,000 event slots.
 Captured values are limited to 1 MiB each and 8 MiB in aggregate. Tracord may

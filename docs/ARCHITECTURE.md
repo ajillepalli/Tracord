@@ -72,9 +72,12 @@ stored argv, and the final trace all have independent bounds.
 Both protocol relays enqueue immutable observation snapshots before forwarding
 them. One bounded FIFO worker performs parsing, redaction, and capture, keeping
 that work off the relay hot path while preserving causal request-before-response
-order. The queue charges active work against its 64-message and 2 MiB limits.
-Saturation never blocks or changes wire traffic; it produces count-only
-`observer_queue_overflow` metadata and a deliberately partial observation.
+order. The queue charges active work against its 64-message limit and exact
+2,097,154-byte limit: two 1 MiB-plus-one observation buffers. Saturation never
+blocks or changes wire traffic; it produces
+count-only `observer_queue_overflow` metadata and a deliberately partial
+observation. Recoverable item failures use `observer_error`; a worker that
+cannot continue uses `observer_worker_failed` for all affected work.
 
 The proxy and command recorder share identity-checked run creation, exclusive
 artifact writes, and atomic `trace.json` publication. POSIX children run in a

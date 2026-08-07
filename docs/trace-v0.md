@@ -195,7 +195,9 @@ and dropped totals, plus stable reason labels. `complete: false` means the tool
 lifecycle is partial; it does not mean the relayed protocol failed. Messages
 that are malformed, unsupported, or larger than the 1 MiB observation buffer
 remain on the wire unchanged. Queue saturation also leaves wire traffic
-unchanged and adds the count-only `observer_queue_overflow` reason.
+unchanged and adds the count-only `observer_queue_overflow` reason. A contained
+per-item observation fault adds `observer_error`; an observation worker that
+cannot continue adds `observer_worker_failed` for every affected message.
 `capture_omitted` reports policy, budget, unsafe value, and final-size omissions
 without retaining the omitted values.
 
